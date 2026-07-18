@@ -1,0 +1,611 @@
+# =============================================================================
+# hoshi-voice-pe.yaml — Custom ESPHome firmware for the HA Voice PE (Route B / Flash)
+# =============================================================================
+#
+# PURPOSE
+#   Turn a Home Assistant Voice PE into a *direct* Hoshi `/ws/audio` client.
+#   - KEEP the upstream audio stack (XMOS voice_kit, dual-I2S, mic, speaker, LED ring).
+#   - REMOVE `voice_assistant` + `api` (those bind the device to Home Assistant).
+#   - ADD `micro_wake_word` (STOCK model "okay_nabu") + our custom `hoshi_ws_audio` external
+#     component, which speaks the Hoshi satellite contract over wss://<your-server>:<port>/ws/audio
+#     — set `hoshi_host`/`hoshi_port` below to your own Hoshi server.
+#
+# WAKE WORD: stay on the NATIVE stock model "okay_nabu" for now —
+#   it is the upstream-shipped, pre-trained microWakeWord model. A custom "Hey Hoshi"
+#   wake is explicitly DEFERRED (no training/measurement work in this pass). When you
+#   later wants a custom wake, swap the model entry (see micro_wake_word: block).
+#
+# STATUS: UNVERIFIED SCAFFOLDING. Does NOT compile as-is. Blockers before first build:
+#   - the hoshi_ws_audio external component is a SKELETON (WS path now LOCKED to esp-idf
+#     esp_websocket_client; connect/send/recv bodies still TODO — see components/hoshi_ws_audio/)
+#   - HOSHI_API_TOKEN (secret, provisioned by hand). TLS approach is RESOLVED: your own
+#     server's self-signed leaf gets embedded as the trust anchor (contract §A
+#     Leaf-Pinning) — swap in your own cert, see components/hoshi_ws_audio/README.md.
+#   - WiFi credentials (substitutions / secrets.yaml — not committed)
+#
+# UPSTREAM SOURCE (all "copied from upstream" blocks below cite this):
+#   esphome/home-assistant-voice-pe @ branch `dev`, file `home-assistant-voice.yaml`
+#   https://github.com/esphome/home-assistant-voice-pe/blob/dev/home-assistant-voice.yaml
+#   Re-verified 2026-06-15 against the raw `dev` file: esp32/psram/i2c/voice_kit/audio_dac/
+#   i2s_audio/microphone/speaker(i2s+resampler)/light/power_supply/binary_sensor pins+values
+#   below all match upstream byte-for-byte; the micro_wake_word `okay_nabu` model URL and the
+#   `stop` model URL also match upstream. Where a value could not be confirmed against that
+#   file it is marked `# TODO(verify upstream: <file>)`.
+#
+# CONTRACT (audio/auth/protocol authority):
+#   docs/PROTOCOL.md in this repo (wire spec, byte-checked against a working reference backend).
+#   - Auth:  Authorization: Bearer <token> (PREFERRED) OR ?token=<HOSHI_API_TOKEN> (fallback)
+#   - Return audio: llm_audio = JSON {seq, data:<base64 WAV>}, WAV PCM16 / 24 kHz / mono
+#     (server normalises engine-independently). NOT a binary frame in v1.
+#   - Inbound mic: PCM16 / 16 kHz / mono ({type:start, mimeType:"audio/pcm;rate=16000", codec:"pcm16"})
+#     + optional S-3 identity fields: room / satelliteId / wakeScore.
+#   - Half-duplex v1 (AEC is dead on this board): mute mic while speaker active.
+#   - {type:abort, turnId} for barge-in — UPLINK ONLY (client→server, contract S-2).
+#   - turnId is echoed on outbound events (S-2): drop frames from a stale turn.
+# =============================================================================
+
+substitutions:
+  name: hoshi-voice-pe
+  friendly_name: Hoshi Voice PE
+  # --- Hoshi backend endpoint (docs/PROTOCOL.md §B). wss + token. ---
+  # EXAMPLE VALUES — set these to YOUR OWN Hoshi server's LAN IP and port.
+  # Use a static/reserved IP for the server; the satellite connects by IP,
+  # not hostname (the TLS leaf's SAN is pinned to one specific IP — see the
+  # TLS section further down and docs/PROTOCOL.md §1).
+  hoshi_host: "192.0.2.10"      # <- your Hoshi server's LAN IP
+  hoshi_port: "8082"            # <- your Hoshi server's wss port
+  hoshi_ws_path: "/ws/audio"
+  # --- Device identity (optional S-3 fields sent in the start frame) ---
+  # satelliteId keys per-device settings/routing on servers that support it
+  # (night_mode, speaker/timer targeting). Must match how you register the
+  # device server-side, if at all — harmless if your backend ignores it.
+  # room is metadata for the same purpose (multi-room future).
+  hoshi_satellite_id: "living-room-voice-pe"   # <- EXAMPLE, pick your own id
+  hoshi_room: "living-room"                     # <- EXAMPLE, pick your own room name
+
+# -----------------------------------------------------------------------------
+# globals — persistent runtime state (NVS-backed via restore_value).
+# `hoshi_volume` tracks the DAC volume set by the physical rotary dial (GPIO16/18).
+# We track volume HERE (a float global), NOT in the encoder's accumulated count, so
+# only the direction triggers (on_clockwise/on_anticlockwise) drive it — no min/max
+# reset gymnastics. Restored on boot + re-asserted into hoshi_ws_audio (single owner).
+# -----------------------------------------------------------------------------
+globals:
+  - id: hoshi_volume
+    type: float
+    restore_value: yes
+    initial_value: '0.85'
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  # micro_wake_word does NOT auto-start in ESPHome — without an explicit start it never
+  # listens, so "Okay Nabu" never fires even though button/WS/mic all work (exactly the
+  # 2026-06-21 on-device symptom). Start it once setup is done (priority -100 = last);
+  # the 2 s delay lets the XMOS voice_kit finish its boot DFU before we begin listening.
+  on_boot:
+    priority: -100
+    then:
+      # ANALOG OUTPUT FIX (2026-06-21): enable the external speaker amplifier.
+      # The HA Voice PE drives its speaker from the aic3204 line-out THROUGH an external
+      # Class-D amp whose shutdown/enable pin is GPIO47. Upstream (home-assistant-voice.yaml
+      # @dev) declares `switch: gpio id=internal_speaker_amp pin=GPIO47 restore_mode=ALWAYS_OFF`
+      # and turns it ON ~1 s after boot (on_boot priority 375). Our trimmed YAML dropped this,
+      # so the full digital chain worked but the amp stayed in SHUTDOWN -> no audible sound.
+      # We enable it once at boot (always-on for the pilot) so the analog stage is live for
+      # every turn. The 1 s delay mirrors upstream (let the amp rail settle before un-shutdown).
+      - delay: 1s
+      - switch.turn_on: internal_speaker_amp
+      # Restore the dial volume into hoshi_ws_audio (the sole volume owner). At this
+      # point the aic3204 may still be in its 2.5 s silent warmup; set_volume_runtime
+      # just stores the value (live=0) and enter_speaking_ applies it on first SPEAKING.
+      # Once warmed up, later dial turns apply live.
+      - lambda: id(hoshi_ws).set_volume_runtime(id(hoshi_volume));
+      - delay: 1s   # remaining ~1 s of the original 2 s XMOS-boot wait before mww.start
+      # B5 (0.8-cutover flash, 2026-07-08): the "stop" model ships loaded but DISABLED —
+      # esphome codegen enables only the FIRST model by default (default_enabled = i==0,
+      # micro_wake_word/__init__.py:499), and for internal models enable() is never
+      # persisted to flash (streaming_model.cpp: pref_ save skipped for internal_only).
+      # So it must be enabled EVERY boot, or voice-cancel never fires.
+      - micro_wake_word.enable_model: stop
+      - micro_wake_word.start:
+
+# -----------------------------------------------------------------------------
+# esp32 / framework — COPIED VERBATIM from upstream `esp32:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `esp32:` block.
+# The sdkconfig_options (PSRAM rodata/instructions, mbedtls TLS1.3, BT-in-PSRAM) are
+# load-bearing for this board — do NOT trim. mbedtls TLS1.3 + EXTERNAL_MEM_ALLOC is
+# exactly what our wss client needs.
+# -----------------------------------------------------------------------------
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+    # --- WS-client dependency = LOCKED (esp-idf managed component) -----------------------
+    # The hoshi_ws_audio component speaks wss via esp-idf `esp_websocket_client`. Its esp-tls
+    # `cert_pem` field is exactly our leaf-pin (contract §A). Declared BOTH here (YAML) and in
+    # the component's __init__.py (esp32.add_idf_component) — the codegen call is authoritative;
+    # this `components:` block documents/locks the dependency + version at the YAML layer too.
+    # Registry: espressif/esp_websocket_client · pinned ^1.7.0 (1.x; 1.7.0 latest 2026-05).
+    # API ref: docs.espressif.com/projects/esp-protocols/esp_websocket_client (latest).
+    # UNVERIFIED until a real esp-idf build resolves the component.
+    components:
+      - name: espressif/esp_websocket_client
+        ref: "^1.7.0"
+
+# -----------------------------------------------------------------------------
+# psram — COPIED VERBATIM from upstream `psram:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `psram:` block.
+# Octal @ 80 MHz is required for the audio buffers + TLS heap on this board.
+# -----------------------------------------------------------------------------
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+# -----------------------------------------------------------------------------
+# logger / ota / wifi — Hoshi additions (NOT from upstream's HA-centric setup).
+# We keep logger + OTA for dev; WiFi must use 2.4 GHz only (firmware/README Phase 2).
+# -----------------------------------------------------------------------------
+logger:
+  # Bring-up: DEBUG for our component over WiFi (api), rest quieted so the log stays
+  # readable. The USB-Serial/JTAG log dies when the main loop stalls — WiFi log survives.
+  # Lower to INFO once the wake-turn is verified.
+  level: DEBUG
+  logs:
+    wifi: INFO
+    api: INFO
+    component: INFO
+    esp-idf: INFO
+    micro_wake_word: INFO
+    hoshi_ws_audio: DEBUG
+
+# api — ESPHome native API, ONLY for reliable WiFi log streaming during bring-up
+# (USB-Serial/JTAG drops when the loop stalls). NOT a Home Assistant integration —
+# no HA connects; nothing here talks to Home Assistant. Plain (no encryption) for local LAN dev.
+api:
+
+ota:
+  - platform: esphome
+    # TODO(hardware-step): set an OTA password via secrets before first WiFi flash.
+    # password: !secret ota_password
+    # LED-Paket 1 (2026-07-08): flash progress as a green fill arc on the ring. The
+    # trigger fires on the main task INSIDE the blocking OTA receive loop, where
+    # loop()/drive_led_ do not run — set_ota_progress therefore paints AND flushes
+    # the strip itself (see hoshi_ws_audio.cpp). x = percent 0..100 (float).
+    on_progress:
+      then:
+        - lambda: id(hoshi_ws).set_ota_progress(x);
+
+wifi:
+  # TODO(hardware-step): provide via secrets.yaml. 2.4 GHz ONLY (no 5 GHz) — see firmware/README.
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # ap: fallback hotspot omitted intentionally for the pilot.
+
+# -----------------------------------------------------------------------------
+# external_components — our custom WS client + the upstream voice_kit (XMOS).
+#   - hoshi_ws_audio: local skeleton (this repo).
+#   - voice_kit: pulled from upstream so the ESP32 can reset+init the XMOS at boot.
+# Source for the voice_kit entry: upstream `external_components:` block (verbatim).
+# -----------------------------------------------------------------------------
+external_components:
+  # Hoshi custom bidirectional WS audio client (skeleton — see ./components/hoshi_ws_audio/README.md)
+  - source:
+      type: local
+      path: components
+    components: [hoshi_ws_audio]
+  # XMOS voice_kit — COPIED VERBATIM from upstream external_components block.
+  # Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `external_components:`.
+  - source:
+      type: git
+      url: https://github.com/esphome/home-assistant-voice-pe
+      ref: dev
+    components:
+      - voice_kit
+    refresh: 0s
+
+# -----------------------------------------------------------------------------
+# i2c — COPIED VERBATIM from upstream `i2c:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `i2c:`.
+# Bus `internal_i2c` carries both the XMOS (voice_kit) and the aic3204 DAC.
+# -----------------------------------------------------------------------------
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+# -----------------------------------------------------------------------------
+# voice_kit (XMOS XU316) — COPIED VERBATIM from upstream `voice_kit:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `voice_kit:`.
+# KEEP THIS. The ESP32 must reset + (re)load the XMOS pipeline over I2C every boot;
+# voice_kit does that. It delivers the cleaned mono stream over I2S into the mic below.
+#
+# ⚠️ firmware: block — per firmware/README Phase 1 step 5: either OMIT this block OR pin
+#   it EXACTLY to the installed XMOS version. A version mismatch triggers an XMOS I2C DFU
+#   (corruption risk). Values below are upstream's v1.3.1; verify against the *installed*
+#   device version BEFORE flashing, or comment the firmware: block out entirely.
+# TODO(hardware-step + verify on-device): confirm installed XMOS firmware version == 1.3.1,
+#   else adjust url/version/md5 or drop the firmware: block.
+# -----------------------------------------------------------------------------
+voice_kit:
+  id: voice_kit_component
+  i2c_id: internal_i2c
+  reset_pin: GPIO4
+  firmware:
+    url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
+    version: "1.3.1"
+    md5: 964635c5bf125529dab14a2472a15401
+
+# -----------------------------------------------------------------------------
+# audio_dac (aic3204) — COPIED VERBATIM from upstream `audio_dac:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `audio_dac:`.
+# -----------------------------------------------------------------------------
+audio_dac:
+  - platform: aic3204
+    id: aic3204_dac
+    i2c_id: internal_i2c
+
+# -----------------------------------------------------------------------------
+# i2s_audio — COPIED VERBATIM from upstream `i2s_audio:` block (dual bus).
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `i2s_audio:`.
+#   i2s_output: LRCLK GPIO7, BCLK GPIO8   (→ speaker / DAC)
+#   i2s_input:  LRCLK GPIO14, BCLK GPIO13 (← XMOS-cleaned mic)
+# Two separate buses = the board's hardware full-duplex path; we still run HALF-duplex
+# in software (AEC dead) — see hoshi_ws_audio.
+# -----------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO14
+    i2s_bclk_pin:
+      number: GPIO13
+
+# -----------------------------------------------------------------------------
+# microphone — pins/format COPIED VERBATIM from upstream `microphone:` (platform i2s_audio).
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `microphone:`.
+# DIN GPIO15, external ADC (the XMOS feeds this), 16 kHz, 32-bit, stereo, secondary mode.
+# NOTE: upstream channel is `stereo` (XMOS returns 2 ch: cleaned + ref). We downmix to
+#   1 ch for both micro_wake_word (channels:1) and the WS uplink (PCM16/16k/mono).
+#
+# on_data: is a HOSHI ADDITION (NOT in upstream — upstream's mic block has no automations;
+#   it routes audio to voice_assistant/micro_wake_word internally). esphome.io confirms the
+#   microphone delivers raw frames (32-bit stereo @16k here) to consumers. The hoshi_ws_audio
+#   component SELF-SUBSCRIBES in setup() (add_data_callback(on_mic_data_) + mic_->start()) and
+#   gates per-frame (half-duplex/hardware-mute, only while a turn is LISTENING), downmixes
+#   32-bit stereo→PCM16 mono (× mic_gain, clip-safe), and uplinks. So there is NO on_data:
+#   automation below.
+#
+# RESOLVED 2026-06-17 (was the compile blocker): the earlier plan routed frames via a YAML
+#   `on_data:` lambda → `id(hoshi_ws).ingest_mic_frame(x)`, but that method never existed
+#   (→ compile error) AND a YAML consumer would DOUBLE-FEED the self-subscription. Dropped the
+#   lambda; the component owns the mic. micro_wake_word ALSO consumes i2s_mics; ESPHome's
+#   microphone fans out to multiple data callbacks. (Fan-out still UNVERIFIED until esp-idf build.)
+# -----------------------------------------------------------------------------
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_din_pin: GPIO15
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+    # NO on_data: automation — hoshi_ws_audio self-subscribes (add_data_callback + mic_->start()
+    # in setup()) and owns gating/downmix/mic_gain/uplink. A YAML lambda would double-feed.
+
+# -----------------------------------------------------------------------------
+# speaker — COPIED from upstream `speaker:` block.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `speaker:`.
+# We keep the i2s_audio_speaker (DOUT GPIO10, 48 kHz, external DAC) and a resampler so
+# the contract's WAV PCM16/24 kHz/mono return stream can be played on the 48 kHz path.
+#
+# Upstream chains: i2s_audio_speaker ← mixer(mixing_speaker) ← resampler(announcement/media).
+# For Hoshi we don't need the dual-source media_player mixer; a single resampler feeding
+# the i2s speaker is enough. We keep ONE resampler (`hoshi_play_speaker`) tuned to our
+# return format (16-bit in, 48 kHz out). The hoshi_ws_audio component plays into it.
+#
+# LIFECYCLE (fix #1, 2026-06-21): the component starts this chain ONCE (first turn) and
+#   keeps it RUNNING — `timeout: never` (below) means the i2s speaker never self-stops, so
+#   the i2s_output bus channel is acquired ONCE and never released+re-acquired per turn.
+#   A per-turn start/finish raced the i2s task's ASYNC channel release (stop_i2s_driver_ ->
+#   parent_->unlock() only runs when the task hits TASK_STOPPED, several loops after finish)
+#   -> next turn's start() try_lock() failed -> "[E] Parent bus is busy" + 1 s retry. With
+#   start-once the i2s task self-fills SILENCE between turns (upstream's always-fill model);
+#   half-duplex still holds (mic gated by turn_state_ + micro_wake_word stop/start).
+# TODO(verify upstream: home-assistant-voice.yaml) — confirm the resampler platform
+#   accepts a 24 kHz/16-bit source and upsamples to 48 kHz cleanly; upstream resamplers
+#   declare sample_rate:48000 / bits_per_sample:16 (matches).
+# -----------------------------------------------------------------------------
+speaker:
+  # i2s sink — COPIED VERBATIM from upstream (i2s_audio_speaker).
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO10
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: aic3204_dac
+  # resampler — adapts the contract's PCM16/24k/mono → 48 kHz i2s sink.
+  # Pattern copied from upstream's `resampler` speakers (announcement_resampling_speaker).
+  - platform: resampler
+    id: hoshi_play_speaker
+    output_speaker: i2s_audio_speaker
+    sample_rate: 48000
+    bits_per_sample: 16
+    # TODO(verify): the source feeds 24 kHz; resampler upsamples to 48k. If the resampler
+    #   needs an explicit input rate, the hoshi_ws_audio component sets it via AudioStreamInfo.
+
+# -----------------------------------------------------------------------------
+# micro_wake_word — on-device wake, STOCK model "okay_nabu" (NATIVE wake).
+# Schema confirmed at esphome.io/components/micro_wake_word.
+# Source for the whole block (microphone wiring + models + vad shape): upstream
+#   `micro_wake_word:` block, re-verified 2026-06-15 against home-assistant-voice.yaml@dev.
+#
+# NO custom "Hey Hoshi" model in this pass — this config stays on the upstream pre-trained model.
+#   The `okay_nabu` model URL below is the EXACT upstream pin (okay_nabu_20241226.3).
+#   To swap to a custom wake later: replace the `okay_nabu` entry's `model:` with the
+#   trained model (local JSON+tflite under hoshi-satellite/wake/ or a release URL) and
+#   keep the rest of the block as-is.
+# -----------------------------------------------------------------------------
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 1          # downmix XMOS stereo → 1 ch for the detector (COPIED from upstream)
+    gain_factor: 4       # COPIED VERBATIM from upstream micro_wake_word.microphone.gain_factor
+  stop_after_detection: false   # COPIED VERBATIM from upstream
+  models:
+    # STOCK wake word — COPIED VERBATIM from upstream micro_wake_word.models (okay_nabu).
+    # Source: home-assistant-voice.yaml@dev. URL re-verified 2026-06-15.
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    # "stop" model — WIRED 2026-07-08 (B5, one flash two wins): voice-cancel a turn.
+    # Detection fires on_wake_word_detected with wake_word=="Stop" (manifest string;
+    # internal:true only hides the model from HA exposure — the trigger still fires,
+    # micro_wake_word.cpp:333). Enabled every boot in on_boot (see there for why).
+    # Half-duplex limit stays: during SPEAKING mww is stopped (fix #7), so "Stop"
+    # is heard in IDLE/LISTENING/THINKING — not over the speaker's own audio.
+    # Source: upstream micro_wake_word models list (stop, internal:true). URL re-verified 2026-06-15.
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
+  vad:
+    # VAD model — upstream leaves `vad:` empty (uses the default model). esphome.io default:
+    #   github://esphome/micro-wake-word-models/models/v2/vad.json
+    # COPIED from upstream (empty `vad:` = default). The component's VAD also gates whether
+    # micro_wake_word forwards audio; we additionally use it as a candidate end-of-speech
+    # signal to drive stop_turn() (see hoshi_ws_audio TODO on who triggers {stop}).
+  on_wake_word_detected:
+    then:
+      - logger.log:
+          format: "Wake: %s"
+          args: ['wake_word.c_str()']
+      # Hand off to our WS client (NON-BLOCKING — only flips atomics + notifies the
+      # off-loop tx task; the wake trigger runs on the main loop, so it MUST NOT do
+      # any socket I/O — that was the 2026-06-21 hang root cause).
+      # B5 branch: "Stop" (the stop model's manifest wake_word) = voice-cancel →
+      # abort_turn() (same loop-safe call as the GPIO0 center button barge-in);
+      # everything else ("Okay Nabu") opens a turn.
+      # LED is driven by the component from loop() per turn-state (LISTENING=cyan).
+      - lambda: |-
+          if (wake_word == "Stop") {
+            id(hoshi_ws).abort_turn();
+          } else {
+            id(hoshi_ws).start_turn(wake_word);
+          }
+
+# -----------------------------------------------------------------------------
+# light — LED ring, COPIED VERBATIM from upstream `light:` (esp32_rmt_led_strip).
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, light: + power_supply:.
+# Pin GPIO21, WS2812, 12 LEDs, GRB, fed by power_supply led_power (GPIO45).
+# Used here only for local state feedback (listening / thinking / speaking).
+# -----------------------------------------------------------------------------
+power_supply:
+  - id: led_power
+    pin: GPIO45
+
+# -----------------------------------------------------------------------------
+# switch — external speaker amplifier enable, COPIED VERBATIM from upstream `switch:`.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `switch:` block.
+# THIS IS THE ANALOG-OUTPUT FIX (2026-06-21). The aic3204 line-out (LOL/LOR) feeds an
+# EXTERNAL Class-D amp; GPIO47 is its shutdown/enable pin. We dropped this when trimming
+# upstream, so the whole digital chain worked (DAC unmuted, line-out at 0 dB, i2s streaming)
+# but the amp stayed in SHUTDOWN -> zero audible sound. We declare the switch here and
+# turn it ON once at boot (esphome.on_boot above) — robust always-on for the pilot.
+# restore_mode ALWAYS_OFF matches upstream (the on_boot turn_on is the single source of truth).
+# -----------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO47
+    id: internal_speaker_amp
+    name: "${friendly_name} Speaker Amp"
+    entity_category: config
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+# -----------------------------------------------------------------------------
+# sensor — physical volume DIAL (HA Voice PE rotary encoder).
+# pin_a GPIO16 / pin_b GPIO18 (both FREE in this firmware — no other consumer).
+# resolution 2 = one detent per physical click. We don't use the accumulated count;
+# the direction triggers bump a float `global` (hoshi_volume) by ±0.05 within the
+# verified [0.30, 0.85] window and push it LIVE into hoshi_ws_audio (sole volume
+# owner). Persistent across reboot via the global's restore_value + the on_boot
+# restore lambda. internal:true = no HA entity (no api/HA integration anyway).
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: rotary_encoder
+    id: hoshi_volume_dial
+    name: "Hoshi Volume Dial"
+    internal: true
+    pin_a: GPIO16
+    pin_b: GPIO18
+    resolution: 2
+    on_clockwise:
+      - lambda: |-
+          float v = id(hoshi_volume) + 0.05f;
+          if (v > 0.85f) v = 0.85f;   // 0.85 = proven distortion-safe ceiling (Class-D amp); 1-line bump if you want it louder
+          id(hoshi_volume) = v;
+          id(hoshi_ws).set_volume_runtime(v);
+    on_anticlockwise:
+      - lambda: |-
+          float v = id(hoshi_volume) - 0.05f;
+          if (v < 0.30f) v = 0.30f;
+          id(hoshi_volume) = v;
+          id(hoshi_ws).set_volume_runtime(v);
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: leds_internal
+    name: "${friendly_name} LEDs"
+    pin: GPIO21
+    chipset: WS2812
+    max_refresh_rate: 15ms
+    num_leds: 12
+    rgb_order: GRB
+    rmt_symbols: 192
+    default_transition_length: 0ms
+    power_supply: led_power
+
+# -----------------------------------------------------------------------------
+# binary_sensor — center button + hardware mute, COPIED VERBATIM from upstream.
+# Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, binary_sensor:.
+#   center_button: GPIO0 (inverted) — repurposed as BARGE-IN / abort trigger.
+#   hardware_mute_switch: GPIO3 (internal) — physical mute; must gate the mic uplink.
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    id: center_button
+    pin:
+      number: GPIO0
+      inverted: true
+    on_press:
+      then:
+        # Center button = barge-in. abort_turn() is NON-BLOCKING (stops playback,
+        # flips atomics, notifies the off-loop tx task which sends {abort,turnId}).
+        # LED returns to IDLE (off) via the component's loop() state machine.
+        - lambda: |-
+            id(hoshi_ws).abort_turn();
+  - platform: gpio
+    id: hardware_mute_switch
+    internal: true
+    pin: GPIO3
+    on_state:
+      then:
+        # Physical mute must hard-gate the uplink (privacy-critical).
+        - lambda: |-
+            id(hoshi_ws).set_hardware_muted(id(hardware_mute_switch).state);
+
+# -----------------------------------------------------------------------------
+# hoshi_ws_audio — OUR custom bidirectional WS client (the heart of Route B).
+# Skeleton lives in ./components/hoshi_ws_audio/. See its README for the full contract map.
+#
+# It:
+#   - connects to wss://${hoshi_host}:${hoshi_port}${hoshi_ws_path} via esp-idf
+#     esp_websocket_client (WEBSOCKET_TRANSPORT_OVER_SSL, cert_pem = embedded server leaf)
+#   - auths via ?token= query (0.8 wall reads ONLY the query at the WS upgrade;
+#     bearer mode remains in the component for 0.5-era compatibility) — contract §A
+#   - on start_turn(): sends {type:start, mimeType:"audio/pcm;rate=16000", codec:"pcm16", turnId}
+#     (optional S-3: room/satelliteId/wakeScore) then streams binary PCM16/16k/mono mic frames
+#   - on stop: sends {type:stop}; barge-in sends {type:abort, turnId} (uplink only)
+#   - receives JSON frames (transcript/llm_delta/llm_audio{seq,data:<base64 WAV>}/
+#     tts_audio_start/tts_audio_end/llm_done/llm_error/sidecar_alarm) and plays the returned
+#     WAV PCM16/24k/mono into `hoshi_play_speaker`. (abort is NOT received — it is uplink only.)
+#   - HALF-DUPLEX: mutes mic capture while the speaker is active (AEC dead)
+# -----------------------------------------------------------------------------
+hoshi_ws_audio:
+  id: hoshi_ws
+  # --- mic = PASSIVE microphone source over i2s_mics (REDESIGN 2026-06-21) ---
+  # The MicrophoneSource gives us already channel-selected, 32->16-bit converted,
+  # gain-applied PCM16 mono — no hand-rolled downmix/gain in C++ anymore. It is
+  # PASSIVE: it never starts/stops the mic; it free-rides on micro_wake_word (the
+  # ACTIVE consumer that powers i2s_mics). channel/gain/bits are HW-tuning knobs.
+  microphone:
+    microphone: i2s_mics
+    channels: [0]          # XMOS cleaned channel (knob — flash-day verify ch0=clean, fix #6)
+    gain_factor: 1         # START AT 1 (XMOS is already AGC'd, fix #6) — raise on flash day
+    bits_per_sample: 16    # MicrophoneSource converts 32->16 for us
+  speaker: hoshi_play_speaker
+  # LED + micro_wake_word handles: the component drives the LED per turn-state from
+  # loop() (the only LightCall-safe context) and stops mww during SPEAKING (fix #7).
+  light: leds_internal
+  micro_wake_word: mww
+  host: ${hoshi_host}
+  port: ${hoshi_port}
+  path: ${hoshi_ws_path}
+  # Identity fields appended to the start frame (send_start_frame_ adds both, if non-empty).
+  # Prerequisite for per-device routing of server-pushed extras (night_mode etc.),
+  # if your backend implements that; harmless metadata otherwise.
+  room: ${hoshi_room}
+  satellite_id: ${hoshi_satellite_id}
+  # --- auth (docs/PROTOCOL.md §A) ---
+  # The reference backend's WS handshake reads the token ONLY from the ?token=
+  # query param (an Authorization: Bearer header is ignored at the WS upgrade
+  # for non-loopback clients) — check your own backend's handshake and set
+  # auth_mode accordingly. The component appends ?token=… to the path; the
+  # token is NOT logged (connect_ logs the token-free path_ member only).
+  # auth_token wired from secrets.yaml. NEVER commit it — secrets.yaml is gitignored.
+  auth_token: !secret hoshi_api_token
+  auth_mode: query         # bearer | query — pick whichever your backend's WS upgrade reads
+  # --- TLS (docs/PROTOCOL.md §A) — leaf-pinning (Trust-On-First-Use). Plain ws:// is a hard NO.
+  # The self-signed leaf of YOUR OWN server is embedded in the component as its
+  # own trust anchor (esp-tls cert_pem) — see hoshi_ws_audio.cpp's SERVER_LEAF_PEM
+  # placeholder, which you must replace before building. No secret/option
+  # needed once that's done — `cacert_pem` only OVERRIDES the embedded default.
+  # Flash-time verify the embedded cert hashes to the SHA-256 fingerprint your
+  # own server actually serves (`openssl x509 -noout -fingerprint -sha256 -in leaf.pem`).
+  # cacert_pem: !secret hoshi_leaf_pem   # optional override; default = embedded leaf
+  # IP-SAN sharp edge (fix #4): if your leaf's SAN is an IP and esp-tls refuses to
+  # validate it against the host string at flash time, set this true (still pins the
+  # exact leaf bytes via cert_pem, so it is NOT a security downgrade).
+  skip_cert_common_name_check: false
+  # --- audio formats (contract §B) ---
+  uplink_sample_rate: 16000      # PCM16 16k mono uplink (WAV per turn)
+  return_sample_rate: 24000      # PCM16 24k mono return -> speaker (YAML resampler -> 48k)
+  half_duplex: true              # mute mic while speaker active (AEC dead)
+  # --- Endpointing vs. background TV (field finding: "keeps listening too long") ---
+  # "Silence" is now RELATIVE to a tracked room noise floor (a slow EMA tracked at
+  # idle — the passive mic source keeps delivering blocks outside of turns too,
+  # because micro_wake_word is always listening): room boundary q = max(0.75x
+  # vad_rms_threshold, ambient x margin) · voice boundary v = max(vad_rms_threshold,
+  # qx4/3). TV level < q => counts as silence, so the turn ends after silence_ms
+  # instead of riding the 10s cap. floor_max caps this against a blaring TV (above
+  # that ceiling, behavior falls back to pre-patch). Tuning: the log shows amb/q/v
+  # per turn.
+  vad_ambient_margin: 1.30
+  vad_silence_floor_max: 2000
+  # --- output volume (fix #2: aic3204 powers up SILENT) ---
+  # The aic3204 DAC defaults to digital volume -127 (silent): its setup() defers
+  # write_volume_() by 2.5 s with volume_=0, clobbering the i2s speaker's boot-time
+  # set_volume(1.0). Upstream re-asserts volume via its media_player (volume_min 0.4 /
+  # max 0.85); we have no media_player, so the component re-asserts this value on the
+  # first SPEAKING (always > 2.5 s after boot) -> aic3204 unmute + DAC vol. 0.85 = the
+  # upstream volume_max. Lower if too loud on flash day.
+  speaker_volume: 0.85

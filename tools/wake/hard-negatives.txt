@@ -1,0 +1,109 @@
+# hard-negatives.txt — "Hey Hoshi" wake-word hard negatives (starter list, German)
+#
+# Purpose: phrases that come ACOUSTICALLY CLOSE to "Hey Hoshi" or come up often
+#          in everyday household conversation, which the model should therefore
+#          NOT trigger on. Train these as the NEGATIVE class (synthesize via
+#          generate-samples.sh AND, better yet, record them for real in your
+#          own household). A high negative_class_weight (reference: 20) makes
+#          false triggers expensive during training.
+#
+# Format: one phrase per line. Lines starting with '#' are comments (skipped
+# by the script). This starter list targets German because that's the
+# language this project's example wake phrase was trained for — swap in your
+# own language's near-miss words/phrases and everyday utterances if you're
+# training a different target language.
+# Deliberately mixed: sound-alikes ("...oshi"/"...oschi"/sibilant endings),
+#                      partial matches on "Hey/Hi", and typical living-room
+#                      utterances (TV, conversation, smart-home commands).
+# Extend this! The closer it is to your own real false triggers, the more it
+# lowers your false-accept rate.
+
+# --- 1) Klang-Zwillinge zu "Hoshi" / "-oshi" / "-oschi" / Zischlaut ---
+Sushi
+Yoshi
+Hoschi
+Hose
+Hosen
+Soße
+Sose
+Dusche
+duschen
+Hörspiel
+Hoodie
+Moschee
+Brosche
+Loch
+Koch
+kochen
+Josua
+Joschka
+Roboter
+hoch
+Hocker
+Hessen
+Hexe
+Hütte
+Hobby
+
+# --- 2) "Hey/Hi/Ey" + irgendwas (Teil-Treffer auf den ersten Silben) ---
+Hey
+Hey du
+Hey Mann
+Hi
+Hallo
+He
+Ey
+Hey Google
+Hey Siri
+Hey Alexa
+Okay Google
+Hey was geht
+Hey komm her
+Hey hör mal
+Hey Schatz
+
+# --- 3) Andere Wake-Words / Assistenten (häufigste Fremd-Trigger) ---
+Alexa
+Computer
+Okay Nabu
+Hey Mycroft
+Jarvis
+
+# --- 4) Namen, die nahe an "Hoshi" liegen ---
+Toschi
+Doschi
+Foschi
+Koschi
+Moshi
+Hoshie
+Hodscha
+
+# --- 5) Typische Haushalts-Utterances (Wohnraum, TV, Küche, Smart-Home) ---
+Mach das Licht an
+Mach das Licht aus
+Mach den Fernseher an
+Wie spät ist es
+Wie ist das Wetter
+Stell einen Timer
+Stell den Wecker
+Spiel Musik
+Lauter
+Leiser
+Stopp
+Pause
+Weiter
+Guten Morgen
+Gute Nacht
+Was gibt es zu essen
+Wer hat angerufen
+Mach die Tür zu
+Es klingelt
+Das Telefon klingelt
+Kommst du mal
+Bist du fertig
+Wo ist die Fernbedienung
+Ich gehe einkaufen
+Tschüss
+Bis später
+Kannst du das hören
+Ist da jemand

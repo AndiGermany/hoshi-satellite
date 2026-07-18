@@ -1,0 +1,18 @@
+# Direct deps for the No-Flash bridge. Pinned to what was installed + verified
+# (Python 3.14.5, macOS arm64, 2026-06-15). aioesphomeapi pulls cryptography,
+# noiseprotocol, protobuf, zeroconf etc. transitively (versions below are FYI).
+aioesphomeapi==45.3.1
+websockets==16.0
+
+# Bridge-side VAD = Silero VAD via ONNX. We depend ONLY on onnxruntime (+numpy),
+# NOT torch: the silero-vad PyPI package forces torch+torchaudio (~hundreds of
+# MB), so instead we ship the Silero ONNX model under bridge/models/ (extracted
+# from the silero-vad wheel) and run it with plain onnxruntime (~18 MB wheel).
+onnxruntime==1.26.0
+numpy==2.4.6
+
+# transitive (recorded for reproducibility; not strictly required to list):
+# cryptography==49.0.0
+# noiseprotocol==0.3.1
+# protobuf==7.35.1
+# zeroconf==0.149.16

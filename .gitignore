@@ -1,0 +1,33 @@
+# Secrets — never commit real credentials.
+firmware/esphome/secrets.yaml
+certs/
+*.pem
+
+# ESPHome build artifacts.
+.esphome/
+*.bin
+*.factory.bin
+*.elf
+*.map
+
+# Python.
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Wake-word training artifacts (large, generated, personal recordings).
+tools/wake/generated-samples/
+tools/wake/piper-sample-generator/
+tools/wake/recordings/*.wav
+tools/wake/recordings/negatives/
+tools/wake/train/work/
+tools/wake/train/trained_models/
+*.tflite
+
+# OS / editor cruft.
+.DS_Store
+*.swp
+.vscode/
+.idea/

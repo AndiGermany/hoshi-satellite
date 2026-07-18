@@ -1,0 +1,110 @@
+# =============================================================================
+# training_parameters.yaml — custom wake-word microWakeWord training config (TEMPLATE)
+# =============================================================================
+#
+#   THIS IS A PARAMETER TEMPLATE, NOT AN AUTO-RUN CONFIG.
+#   Training does NOT run on a laptop-class machine (RAM/no-CUDA wall) — it
+#   runs on an external GPU/Colab/Docker environment. Exact steps: see
+#   ./TRAIN-RUNBOOK.md.
+#
+#   Format/keys verified against OHF-Voice/micro-wake-word (formerly
+#   kahrendt/microWakeWord) `model_train_eval` and its reference training
+#   notebook. The augmentation values mirror ../README.md §4.
+#
+#   Paths below are RELATIVE to the training working directory on your GPU
+#   box. Adjust to match your own folder layout before running (see
+#   TRAIN-RUNBOOK.md step 3).
+# =============================================================================
+
+# --- General / output ---------------------------------------------------------
+train_dir: trained_models/hey_hoshi      # checkpoints + export land here
+clip_duration_ms: 1500                    # window length (ms) of the wake phrase (~0.6-1.0s + margin)
+window_step_ms: 10                        # MUST match feature_step_size in the JSON manifest (10)
+
+# Training length: per-phase step counts (multiple phases with decaying LR).
+# MODERATE for a first custom model; upstream guidance expects multiple rounds.
+training_steps:        [10000, 10000, 10000]
+learning_rates:       [0.001, 0.0005, 0.00025]
+batch_size:           128
+eval_step_interval:   500
+positive_class_weight: [1]
+negative_class_weight: [20]               # make false triggers expensive (see ../README.md §5, reference value 20)
+
+# --- On-device target values (flow into the JSON manifest, retune in-room) ---
+# These drive "best_weights" selection and the default threshold at export time.
+target_minimization: 0.9                  # target accuracy during threshold search
+minimization_metric: null                 # null = accuracy; alt: average_viable_recall
+maximization_metric: average_viable_recall
+
+# probability_cutoff / sliding_window_size are ON-DEVICE tuning knobs (ESPHome).
+# Here they're the training/export default; tune for real in your own room
+# (see ../README.md §6) before treating these as final.
+probability_cutoff:   0.97                # higher -> fewer false accepts, more false rejects
+sliding_window_size:  5                   # how many windows are averaged (more -> more sluggish, more robust)
+
+# --- Datasets (features as ragged mmaps; produced in TRAIN-RUNBOOK step 4) ---
+# Each entry: one precomputed spectrogram mmap + a sampling weight.
+# Positive = synthetic wake-phrase samples (generate-samples.sh) + REAL recordings (gold standard).
+# Negative = generic speech/silence (HF kahrendt/microwakeword) + hard negatives.
+features:
+  # ---- POSITIVE ---------------------------------------------------------------
+  - features_dir: features/positives_mmap
+    sampling_weight: 1.0
+    penalty_weight:  1.0
+    truth: true                            # positive class
+    truncation_strategy: truncate_start
+
+  # ---- HARD NEGATIVES (synthesized from hard-negatives.txt + real recordings) -
+  - features_dir: features/hard_negatives_mmap
+    sampling_weight: 1.0
+    penalty_weight:  1.0
+    truth: false
+    truncation_strategy: truncate_start
+
+  # ---- GENERIC NEGATIVES (HF kahrendt/microwakeword: speech/no_speech) --------
+  #   -> TRAIN-RUNBOOK step 2 downloads speech.zip / no_speech.zip / dinner_party.zip.
+  - features_dir: features/generic_negatives_mmap
+    sampling_weight: 1.0
+    penalty_weight:  1.0
+    truth: false
+    truncation_strategy: split
+
+# --- Augmentation (applied to clips BEFORE spectrogram computation) ----------
+# Covers all four target axes: background noise, RIR, gain, pitch/tempo.
+# (Tempo is additionally already varied at synthesis time via --length-scales.)
+augmentation:
+  augmentation_duration_s: 3.2
+  probabilities:
+    SevenBandParametricEQ: 0.1
+    TanhDistortion:        0.1
+    PitchShift:            0.1            # (pitch)
+    BandStopFilter:        0.1
+    AddColorNoise:         0.1
+    AddBackgroundNoise:    0.75           # (background) — the most important lever
+    Gain:                  1.0            # (gain) — always on
+    RIR:                   0.5            # (room impulse response) — room reverb
+  # External sets — TRAIN-RUNBOOK step 2 downloads these (on the GPU box, not locally):
+  impulse_paths:     [mit_rirs]                  # MIT RIR set
+  background_paths:  [fma_16k, audioset_16k]     # background audio (16 kHz)
+  background_min_snr_db: -5
+  background_max_snr_db: 10
+  min_jitter_s: 0.195
+  max_jitter_s: 0.205
+
+# --- SpecAugment (applied to spectrograms during training) -------------------
+spec_augment:
+  enabled: true
+  freq_mask_max_size: 7                   # masked frequency bands
+  freq_mask_count:    2
+  time_mask_max_size: 10                  # masked time bands
+  time_mask_count:    2
+
+# --- Model architecture (mixednet, upstream reference for ESP32-S3) ----------
+# Passed via CLI to model_train_eval; recorded here for documentation.
+model:
+  type: mixednet
+  pointwise_filters: "64,64,64,64"
+  stride: 3
+  # Export: streamed, internally-quantized TFLite (ESPHome-compatible).
+  # tensor_arena_size is determined at export time -> copy it into the JSON manifest
+  # (reference value for the stock okay_nabu model: 26080; your own model may differ).

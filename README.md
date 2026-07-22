@@ -8,6 +8,19 @@ server over a `wss://.../ws/audio` WebSocket.
 
 ---
 
+## Die drei Repos · The three repositories
+
+| | |
+|---|---|
+| [**hoshi-0.8**](https://github.com/AndiGermany/hoshi-0.8) | Das Backend, mit dem diese Firmware spricht: Assistent, Oberfläche, Sidecars, Wire-Protokoll · *The backend this firmware talks to* |
+| **hoshi-satellite** *(hier · here)* | Die Firmware auf dem Gerät · *The firmware on the device* |
+| [**collab-os**](https://github.com/AndiGermany/collab-os) | Das Making-of: wie eine Person mit KI-Agenten das gebaut hat, Fehlschläge inklusive · *How it was built, mistakes included* |
+
+Ohne das Backend ist diese Firmware ein Gerät ohne Gegenstelle — der
+`ws/audio`-Vertrag ist dort dokumentiert.
+
+---
+
 ## EN TL;DR
 
 - **Hardware:** [Home Assistant Voice Preview Edition](https://www.home-assistant.io/voice-pe/)

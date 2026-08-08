@@ -80,7 +80,10 @@ substitutions:
   #   wake_model_id: "okay_nabu"
   # (okay_nabu ist ohnehin Modell-Index 0 in der models:-Liste unten und damit
   # der ESPHome-Stock-Fallback, der PER DEFAULT enabled ist — siehe Kommentar dort.)
-  wake_model: "hey_hoshi.json"
+  # Default = das Release-Asset (v1, trainiert+kalibriert; CI-Beweis 2026-08-08:
+  # die lokale Datei liegt BEWUSST nicht im Git — Blobs kommen als Release).
+  # Offline-Arbeit am Modell: Zeile auf die lokale "hey_hoshi.json" flippen.
+  wake_model: "https://github.com/AndiGermany/hoshi-satellite/releases/download/hey-hoshi-v1/hey_hoshi.json"
   wake_model_id: "hey_hoshi"
   # Kalibrierwert des Wake-Detektors (Lauf 2, 20.07 — siehe models:-Kommentar unten:
   # TV-Fehlalarme bei 0.74-0.80 -> auf 0.82 angehoben).

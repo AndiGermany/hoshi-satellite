@@ -1,0 +1,62 @@
+# .github/workflows/esphome-ci.yml — managed by pipeline/publish-satellite.sh
+# in the private source repo. Regenerated on every publish run; hand edits
+# here will be overwritten by the next sync (edit the generator instead).
+name: ESPHome firmware CI
+
+on:
+  push:
+    paths:
+      - "firmware/esphome/**"
+      - ".github/workflows/esphome-ci.yml"
+  pull_request:
+    paths:
+      - "firmware/esphome/**"
+      - ".github/workflows/esphome-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/esphome
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read esphome min_version pin from the config
+        id: pin
+        run: |
+          PIN="$(grep -m1 -E '^[[:space:]]*min_version:' hoshi-voice-pe.yaml | sed -E 's/^[^:]*:[[:space:]]*//; s/"//g' | tr -d '\r' | xargs || true)"
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+          if [ -n "$PIN" ]; then
+            echo "Pinned via esphome.min_version: $PIN"
+          else
+            echo "::warning::hoshi-voice-pe.yaml has no esphome.min_version — installing latest esphome (unpinned). Consider adding one so CI tracks a known-good version."
+          fi
+
+      - name: Install esphome
+        run: |
+          if [ -n "${{ steps.pin.outputs.pin }}" ]; then
+            pip install "esphome==${{ steps.pin.outputs.pin }}"
+          else
+            pip install esphome
+          fi
+          esphome version
+
+      - name: Stub secrets.yaml for CI (no real credentials exist here)
+        run: |
+          if [ -f secrets.yaml.example ]; then
+            cp secrets.yaml.example secrets.yaml
+          else
+            echo "::warning::secrets.yaml.example is missing — compile will likely fail on !secret lookups."
+          fi
+
+      - name: esphome config (schema + substitution check)
+        run: esphome config hoshi-voice-pe.yaml
+
+      - name: esphome compile
+        run: esphome compile hoshi-voice-pe.yaml

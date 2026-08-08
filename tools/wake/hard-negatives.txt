@@ -1,22 +1,15 @@
-# hard-negatives.txt — "Hey Hoshi" wake-word hard negatives (starter list, German)
+# hard-negatives.txt — "Hey Hoshi" Wake-Word Hard-Negatives (Starter, DE)
+# Ticket: T162 · Lane: satellite-hand
 #
-# Purpose: phrases that come ACOUSTICALLY CLOSE to "Hey Hoshi" or come up often
-#          in everyday household conversation, which the model should therefore
-#          NOT trigger on. Train these as the NEGATIVE class (synthesize via
-#          generate-samples.sh AND, better yet, record them for real in your
-#          own household). A high negative_class_weight (reference: 20) makes
-#          false triggers expensive during training.
+# Zweck: Phrasen, die "Hey Hoshi" AKUSTISCH NAHE kommen oder im Haushalt oft fallen,
+#        und das Modell darum NICHT triggern dürfen. Diese als NEGATIV-Klasse trainieren
+#        (synthetisieren via generate-samples.sh UND besser noch im Haushalt aufnehmen).
+#        Hohes negative_class_weight (Referenz: 20) macht Fehlauslöser teuer.
 #
-# Format: one phrase per line. Lines starting with '#' are comments (skipped
-# by the script). This starter list targets German because that's the
-# language this project's example wake phrase was trained for — swap in your
-# own language's near-miss words/phrases and everyday utterances if you're
-# training a different target language.
-# Deliberately mixed: sound-alikes ("...oshi"/"...oschi"/sibilant endings),
-#                      partial matches on "Hey/Hi", and typical living-room
-#                      utterances (TV, conversation, smart-home commands).
-# Extend this! The closer it is to your own real false triggers, the more it
-# lowers your false-accept rate.
+# Format: eine Phrase pro Zeile. Zeilen mit '#' = Kommentar (vom Skript übersprungen).
+# Bewusst gemischt: Klang-Verwechsler ("...oshi"/"...oschi"/zischlaut), Teil-Wort "Hey/Hi",
+#                   und typische Wohnraum-Utterances (TV, Gespräch, Smart-Home).
+# Erweitern! Je näher an euren echten Fehlauslösern, desto besser sinkt die FAR.
 
 # --- 1) Klang-Zwillinge zu "Hoshi" / "-oshi" / "-oschi" / Zischlaut ---
 Sushi

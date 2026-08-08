@@ -13,7 +13,7 @@
 #     4. IDF esp_websocket_client task (ws_event_) — TLS+recv+dispatch.
 #
 # WS client = esp-idf `esp_websocket_client` (managed IDF component, ^1.7.0),
-#   pulled via esp32.add_idf_component. Its esp-tls cert_pem is the server leaf-pin.
+#   pulled via esp32.add_idf_component. Its esp-tls cert_pem is the hoshi-server leaf-pin.
 # =============================================================================
 
 import esphome.codegen as cg
@@ -89,10 +89,19 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Required(CONF_HOST): cv.string,
-        cv.Optional(CONF_PORT, default=8081): cv.port,
+        # 0.8-Realität (2026-08-08): Hoshi 0.5/:8081 ist retired, 0.8-Prod läuft auf
+        # :8082 (siehe hoshi-voice-pe.yaml Kopf-Kommentar 0.8-CUTOVER 2026-07-08).
+        # Falsche Defaults hier wären ein STUMMES Close 1008, wenn eine fremde YAML
+        # den `port:`/`auth_mode:`-Key mal weglässt. Andis eigene YAML setzt beide
+        # Keys explizit (hoshi-voice-pe.yaml: port: ${hoshi_port} = "8082",
+        # auth_mode: query) — dieser Default-Wechsel ändert für ihn NICHTS.
+        cv.Optional(CONF_PORT, default=8082): cv.port,
         cv.Optional(CONF_PATH, default="/ws/audio"): cv.string,
         cv.Optional(CONF_AUTH_TOKEN, default=""): cv.string,
-        cv.Optional(CONF_AUTH_MODE, default="bearer"): cv.one_of(*AUTH_MODES, lower=True),
+        # 0.8 WS wall liest den Token NUR aus dem ?token=-Query-Param (siehe YAML-
+        # Kommentar bei auth_mode); "bearer" bleibt nur für 0.5-era-Kompatibilität im
+        # Schema. Default jetzt "query" — Andis YAML setzt auth_mode explizit, siehe oben.
+        cv.Optional(CONF_AUTH_MODE, default="query"): cv.one_of(*AUTH_MODES, lower=True),
         cv.Optional(CONF_CACERT_PEM, default=""): cv.string,
         # IP-SAN sharp edge (red-team fix #4): if the leaf has an IP SAN that esp-tls
         #   won't validate against the host, allow skipping the CN/SAN check (still
@@ -181,7 +190,11 @@ async def to_code(config):
         cg.add(var.set_micro_wake_word(mww))
 
     # --- WS client = esp-idf esp_websocket_client (managed IDF component) -----------------
+    # PINNED EXACT 1.7.0 (2026-08-08, matches hoshi-voice-pe.yaml esp32.components pin —
+    # this codegen call is the authoritative declaration, the YAML block documents/locks
+    # it too). Verified against a real successful build's dependencies.lock — see the YAML
+    # comment for the resolved component_hash + upstream commit_sha.
     esp32.add_idf_component(
         name="espressif/esp_websocket_client",
-        ref="^1.7.0",
+        ref="1.7.0",
     )

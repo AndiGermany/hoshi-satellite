@@ -7,20 +7,19 @@
 #   - KEEP the upstream audio stack (XMOS voice_kit, dual-I2S, mic, speaker, LED ring).
 #   - REMOVE `voice_assistant` + `api` (those bind the device to Home Assistant).
 #   - ADD `micro_wake_word` (STOCK model "okay_nabu") + our custom `hoshi_ws_audio` external
-#     component, which speaks the Hoshi satellite contract over wss://<your-server>:<port>/ws/audio
-#     — set `hoshi_host`/`hoshi_port` below to your own Hoshi server.
+#     component, which speaks the Hoshi satellite contract over wss://<host>:8082/ws/audio
+#     (0.8-CUTOVER 2026-07-08: Hoshi 0.8 backend on hoshi-server:8082; 0.5/:8081 is retired).
 #
-# WAKE WORD: stay on the NATIVE stock model "okay_nabu" for now —
+# WAKE WORD (the maintainer 2026-06-15): stay on the NATIVE stock model "okay_nabu" for now —
 #   it is the upstream-shipped, pre-trained microWakeWord model. A custom "Hey Hoshi"
-#   wake is explicitly DEFERRED (no training/measurement work in this pass). When you
+#   wake is explicitly DEFERRED (no training/measurement work in this pass). When the maintainer
 #   later wants a custom wake, swap the model entry (see micro_wake_word: block).
 #
 # STATUS: UNVERIFIED SCAFFOLDING. Does NOT compile as-is. Blockers before first build:
 #   - the hoshi_ws_audio external component is a SKELETON (WS path now LOCKED to esp-idf
 #     esp_websocket_client; connect/send/recv bodies still TODO — see components/hoshi_ws_audio/)
-#   - HOSHI_API_TOKEN (secret, provisioned by hand). TLS approach is RESOLVED: your own
-#     server's self-signed leaf gets embedded as the trust anchor (contract §A
-#     Leaf-Pinning) — swap in your own cert, see components/hoshi_ws_audio/README.md.
+#   - HOSHI_API_TOKEN (hardware-gated secret). TLS is RESOLVED: the hoshi-server self-signed leaf is
+#     embedded as the trust anchor (contract §A Leaf-Pinning) — no cert TODO remains.
 #   - WiFi credentials (substitutions / secrets.yaml — not committed)
 #
 # UPSTREAM SOURCE (all "copied from upstream" blocks below cite this):
@@ -32,8 +31,8 @@
 #   `stop` model URL also match upstream. Where a value could not be confirmed against that
 #   file it is marked `# TODO(verify upstream: <file>)`.
 #
-# CONTRACT (audio/auth/protocol authority):
-#   docs/PROTOCOL.md in this repo (wire spec, byte-checked against a working reference backend).
+# CONTRACT (audio/auth/protocol authority) — v1.1, byte-checked:
+#   hoshi-satellite/CONTRACT.md (satellite view) + wiki/satellite-contract-0.7.md (server v1.1)
 #   - Auth:  Authorization: Bearer <token> (PREFERRED) OR ?token=<HOSHI_API_TOKEN> (fallback)
 #   - Return audio: llm_audio = JSON {seq, data:<base64 WAV>}, WAV PCM16 / 24 kHz / mono
 #     (server normalises engine-independently). NOT a binary frame in v1.
@@ -47,21 +46,69 @@
 substitutions:
   name: hoshi-voice-pe
   friendly_name: Hoshi Voice PE
-  # --- Hoshi backend endpoint (docs/PROTOCOL.md §B). wss + token. ---
-  # EXAMPLE VALUES — set these to YOUR OWN Hoshi server's LAN IP and port.
-  # Use a static/reserved IP for the server; the satellite connects by IP,
-  # not hostname (the TLS leaf's SAN is pinned to one specific IP — see the
-  # TLS section further down and docs/PROTOCOL.md §1).
-  hoshi_host: "192.0.2.10"      # <- your Hoshi server's LAN IP
-  hoshi_port: "8082"            # <- your Hoshi server's wss port
+  # --- Hoshi backend endpoint (contract §B). wss + token. ---
+  # hoshi-server is a fixed LXC at 192.0.2.10 (static; the DHCP-drift risk is the Mac,
+  # not this host). 0.8-CUTOVER 2026-07-08: port 8081 (Hoshi 0.5, retired) → 8082
+  # (Hoshi 0.8 prod, systemd hoshi-0.8-backend). Live-verified 2026-07-08: :8082
+  # serves HTTPS with the new leaf below and answers 401 without / 200-family with token.
+  hoshi_host: "192.0.2.10"
+  hoshi_port: "8082"
   hoshi_ws_path: "/ws/audio"
-  # --- Device identity (optional S-3 fields sent in the start frame) ---
-  # satelliteId keys per-device settings/routing on servers that support it
-  # (night_mode, speaker/timer targeting). Must match how you register the
-  # device server-side, if at all — harmless if your backend ignores it.
-  # room is metadata for the same purpose (multi-room future).
-  hoshi_satellite_id: "living-room-voice-pe"   # <- EXAMPLE, pick your own id
-  hoshi_room: "living-room"                     # <- EXAMPLE, pick your own room name
+  # --- Geräte-Identität (S-3, seit 15.07 AKTIV gesendet) ---
+  # satelliteId keyt die per-Gerät-Zuordnung im Backend (WsDeviceRegistry): Nachtmodus-
+  # Settings, später speaker/timer_state-Targeting. MUSS mit der Id übereinstimmen,
+  # unter der the maintainer das Gerät in den FE-Settings konfiguriert. room ist der S-3-Vorgriff
+  # auf den Raum-Default (P2) — heute nur Log-/Metadaten, tut nichts weh.
+  hoshi_satellite_id: "kueche-voice-pe"
+  hoshi_room: "kueche"
+
+  # -----------------------------------------------------------------------------
+  # AUFTRAG "Fremder fasst nur den Kopf an" (2026-08-08): alle Werte unten sind
+  # Andis LIVE-Defaults — ein Re-Flash mit dieser Datei unverändert ändert NICHTS
+  # am Geräteverhalten (einzige gewollte Ausnahme: log_level, jetzt INFO statt
+  # DEBUG — siehe dort). Ein Fremder mit eigenem Voice-PE ändert NUR diesen Kopf
+  # + secrets.yaml (Vorlage: secrets.yaml.example) — der Rest der YAML bleibt
+  # unangetastet. Details/Tuning-Historie stehen bei den jeweiligen Original-
+  # Stellen weiter unten; hier nur die Kopf-Substitution + der Default.
+  # -----------------------------------------------------------------------------
+  # --- Wake-Word (micro_wake_word custom model, siehe models: weiter unten) ---
+  # Default = Andis lokaler "Hey Hoshi"-Pfad (hey_hoshi.json neben dieser YAML,
+  # NICHT im Repo committed — Release-Asset-Plan ist vorgesehen, aber NICHT Teil
+  # dieses Passes). Ein Fremder OHNE dieses trainierte Modell setzt hier entweder
+  # die künftige Release-Asset-URL ein oder fällt auf den Stock-Wake zurück:
+  #   wake_model: "https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json"
+  #   wake_model_id: "okay_nabu"
+  # (okay_nabu ist ohnehin Modell-Index 0 in der models:-Liste unten und damit
+  # der ESPHome-Stock-Fallback, der PER DEFAULT enabled ist — siehe Kommentar dort.)
+  wake_model: "hey_hoshi.json"
+  wake_model_id: "hey_hoshi"
+  # Kalibrierwert des Wake-Detektors (Lauf 2, 20.07 — siehe models:-Kommentar unten:
+  # TV-Fehlalarme bei 0.74-0.80 -> auf 0.82 angehoben).
+  wake_cutoff: "0.82"
+  # --- Mic-Gain — ZWEI unabhängige Knöpfe, bewusst NICHT zu einer Substitution
+  # zusammengelegt: mww verstärkt nur für den Wake-Detektor (gain_factor 4), der
+  # hoshi_ws_audio-Uplink nutzt den bereits XMOS-AGC'ten Rohstream (gain_factor 1,
+  # Flash-Tag-Tuning-Knopf, fix #6). EIN gemeinsames ${mic_gain} hätte beide auf
+  # denselben Wert gezwungen und damit Andis Live-Verhalten geändert — deshalb
+  # zwei getrennt benannte Substitutionen (Abweichung vom Auftragstext dokumentiert,
+  # siehe RATE-STELLEN in der Rückgabe dieses Passes).
+  mic_gain_wake: "4"
+  mic_gain_ws: "1"
+  # --- Lautstärke — Dial-Grenzen [vol_min, vol_max] + Boot-/Turn-Default (fix #2:
+  # die aic3204 powert SILENT hoch, der erste SPEAKING-Moment re-assertet vol_default).
+  vol_min: "0.30"
+  vol_max: "0.85"
+  vol_default: "0.85"
+  # --- Endpointing vs. Hintergrund-TV (field finding 17.07, siehe hoshi_ws_audio:-
+  # Block weiter unten für die volle Formel-Erklärung).
+  vad_ambient_margin: "1.30"
+  vad_floor_max: "2000"
+  # --- Log-Level: Default INFO (leiser Stand-Betrieb). Andis voller Diagnose-
+  # Modus (DEBUG auf logger + micro_wake_word + hoshi_ws_audio) ist EINE Kopf-
+  # Zeile entfernt — einfach auf DEBUG setzen:
+  #   log_level: DEBUG
+  # stellt exakt den bisherigen (vor diesem Pass aktiven) Zustand wieder her.
+  log_level: "INFO"
 
 # -----------------------------------------------------------------------------
 # globals — persistent runtime state (NVS-backed via restore_value).
@@ -74,11 +121,16 @@ globals:
   - id: hoshi_volume
     type: float
     restore_value: yes
-    initial_value: '0.85'
+    initial_value: '${vol_default}'
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  # bewiesene Kombi (RUNBOOK.md Kopf + lokal reproduziert 2026-08-08 aus dem
+  # .esphome/build-Cache eines echten grünen Compiles: esphome_version 2026.5.3,
+  # gebaut mit espidf-5.5.4-venv, build_time_str 2026-07-20 21:42:20). Verhindert,
+  # dass ein Fremder mit einer älteren/inkompatiblen ESPHome-CLI kompiliert.
+  min_version: "2026.5.3"
   # micro_wake_word does NOT auto-start in ESPHome — without an explicit start it never
   # listens, so "Okay Nabu" never fires even though button/WS/mic all work (exactly the
   # 2026-06-21 on-device symptom). Start it once setup is done (priority -100 = last);
@@ -108,6 +160,15 @@ esphome:
       # persisted to flash (streaming_model.cpp: pref_ save skipped for internal_only).
       # So it must be enabled EVERY boot, or voice-cancel never fires.
       - micro_wake_word.enable_model: stop
+      # Lauf-2-Befund (20.07): hey_hoshi ist Position 1 in models -> default DISABLED
+      # (gleiche i==0-Falle wie beim stop-Modell). Drei Cutoff-Experimente liefen
+      # gegen ein nie aktiviertes Modell. Explizit enablen, jeder Boot, wie stop.
+      # ${wake_model_id} statt hartem "hey_hoshi" (Fund, 2026-08-08): ein hartcodiertes
+      # enable_model: hey_hoshi bricht diesen on_boot-Schritt (Component-Fehler beim
+      # Boot), sobald jemand das custom Modell aus der models:-Liste wirft und nur mit
+      # okay_nabu fährt — die Substitution macht das Gerät für Fremde konsistent
+      # konfigurierbar (Kopf-Zeile ändern statt YAML durchsuchen).
+      - micro_wake_word.enable_model: ${wake_model_id}
       - micro_wake_word.start:
 
 # -----------------------------------------------------------------------------
@@ -140,12 +201,17 @@ esp32:
     # `cert_pem` field is exactly our leaf-pin (contract §A). Declared BOTH here (YAML) and in
     # the component's __init__.py (esp32.add_idf_component) — the codegen call is authoritative;
     # this `components:` block documents/locks the dependency + version at the YAML layer too.
-    # Registry: espressif/esp_websocket_client · pinned ^1.7.0 (1.x; 1.7.0 latest 2026-05).
+    # Registry: espressif/esp_websocket_client · PINNED EXACT 1.7.0 (2026-08-08 —
+    # verified against a real, successful local build: .esphome/build/hoshi-voice-pe/
+    # dependencies.lock resolves espressif/esp_websocket_client to version 1.7.0,
+    # component_hash 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb,
+    # upstream commit_sha b385915ca011094238f5e8ebc45d539183b09cf2 (esp-protocols repo).
+    # bewiesener Stand — no longer a caret range. If this ever needs bumping, re-derive
+    # from a fresh dependencies.lock, don't guess.
     # API ref: docs.espressif.com/projects/esp-protocols/esp_websocket_client (latest).
-    # UNVERIFIED until a real esp-idf build resolves the component.
     components:
       - name: espressif/esp_websocket_client
-        ref: "^1.7.0"
+        ref: "1.7.0"
 
 # -----------------------------------------------------------------------------
 # psram — COPIED VERBATIM from upstream `psram:` block.
@@ -164,25 +230,41 @@ psram:
 logger:
   # Bring-up: DEBUG for our component over WiFi (api), rest quieted so the log stays
   # readable. The USB-Serial/JTAG log dies when the main loop stalls — WiFi log survives.
-  # Lower to INFO once the wake-turn is verified.
-  level: DEBUG
+  # ${log_level} (Default INFO, 2026-08-08): all three DEBUG-diagnose lines below are
+  # coupled to the SAME substitution — setting log_level: DEBUG in the substitutions
+  # header restores the maintainer's exact prior diagnose setup (top-level + micro_wake_word +
+  # hoshi_ws_audio all DEBUG) in one edit, no hunting through the file.
+  level: ${log_level}
   logs:
     wifi: INFO
     api: INFO
     component: INFO
     esp-idf: INFO
-    micro_wake_word: INFO
-    hoshi_ws_audio: DEBUG
+    micro_wake_word: ${log_level}  # DIAGNOSE 20.07: Arena-Probe + Modell-Details sichtbar machen
+    hoshi_ws_audio: ${log_level}
 
 # api — ESPHome native API, ONLY for reliable WiFi log streaming during bring-up
 # (USB-Serial/JTAG drops when the loop stalls). NOT a Home Assistant integration —
-# no HA connects; nothing here talks to Home Assistant. Plain (no encryption) for local LAN dev.
+# no HA connects; the maintainer's no-HA veto stands. Plain (no encryption) for local LAN dev.
+#
+# EMPFEHLUNG (dokumentiert, NICHT scharf, 2026-08-08): api-Encryption würde beim
+# nächsten Flash Andis bestehende (unverschlüsselte) ESPHome-Log-Verbindung brechen —
+# deshalb hier nur als Rezept, nicht aktiv. Wer sie scharf schalten will:
+#   api:
+#     encryption:
+#       key: !secret api_encryption_key   # 32-byte base64, `esphome secrets` kann sie generieren
+# (secrets.yaml.example bringt absichtlich KEINEN api_encryption_key-Platzhalter mit,
+# solange das nicht scharf ist.)
 api:
 
 ota:
   - platform: esphome
-    # TODO(hardware-step): set an OTA password via secrets before first WiFi flash.
-    # password: !secret ota_password
+    # SCHARF (2026-08-08): the key exists in secrets.yaml (ota_password) — an
+    # unauthenticated OTA endpoint on the LAN is an easy foot-gun for a stranger's
+    # device, so we default this ON. NOT a live-behavior change for the maintainer beyond
+    # "OTA now needs the password from his secrets.yaml" (the key was already
+    # provisioned there).
+    password: !secret ota_password
     # LED-Paket 1 (2026-07-08): flash progress as a green fill arc on the ring. The
     # trigger fires on the main task INSIDE the blocking OTA receive loop, where
     # loop()/drive_led_ do not run — set_ota_progress therefore paints AND flushes
@@ -195,7 +277,22 @@ wifi:
   # TODO(hardware-step): provide via secrets.yaml. 2.4 GHz ONLY (no 5 GHz) — see firmware/README.
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  # ap: fallback hotspot omitted intentionally for the pilot.
+  # WLAN-Rettung (additiv, 2026-08-08): falls die konfigurierten Zugangsdaten nicht
+  # greifen (falsches WLAN, Passwort-Tippfehler bei einem Fremd-Flash), macht ESPHome
+  # automatisch diesen Fallback-Hotspot auf statt stumm offline zu bleiben. SSID aus
+  # ${name} — Andis Gerät verbindet sich normalerweise nie dorthin (WLAN steht), das
+  # ist reines Sicherheitsnetz, kein Verhaltenswechsel im Normalbetrieb.
+  ap:
+    ssid: "${name} Fallback"
+
+# captive_portal + improv_serial gehören zur WLAN-Rettung oben: captive_portal bedient
+# die Konfig-Seite, sobald ein Client sich mit dem ap:-Hotspot verbindet; improv_serial
+# erlaubt WLAN-Onboarding über USB-Seriell (z.B. via ESPHome Web/Improv-fähige Tools)
+# ganz ohne vorher ins WLAN zu müssen. Beides additiv, kein Einfluss auf den normalen
+# Boot-Pfad, solange WiFi verbindet.
+captive_portal:
+
+improv_serial:
 
 # -----------------------------------------------------------------------------
 # external_components — our custom WS client + the upstream voice_kit (XMOS).
@@ -211,10 +308,16 @@ external_components:
     components: [hoshi_ws_audio]
   # XMOS voice_kit — COPIED VERBATIM from upstream external_components block.
   # Source: home-assistant-voice-pe@dev home-assistant-voice.yaml, `external_components:`.
+  # PINNED (2026-08-08) — bewiesener Stand: dies ist der exakte Commit, den ein lokaler,
+  # GRÜN kompilierter Build (.esphome/external_components/3bf38338, .git/FETCH_HEAD +
+  # packed-refs; deckungsgleich mit .esphome/build/hoshi-voice-pe/build_info.json,
+  # build_time_str 2026-07-20 21:42:20, esphome_version 2026.5.3) tatsächlich aufgelöst
+  # hat — kein geratenes Tages-SHA. `ref: dev` würde bei jedem Fremd-Build neu auflösen
+  # und den bewiesenen Stand stillschweigend verlassen.
   - source:
       type: git
       url: https://github.com/esphome/home-assistant-voice-pe
-      ref: dev
+      ref: 0579e7b9d8504264719c593474c85447253c9dc1
     components:
       - voice_kit
     refresh: 0s
@@ -240,17 +343,32 @@ i2c:
 #   it EXACTLY to the installed XMOS version. A version mismatch triggers an XMOS I2C DFU
 #   (corruption risk). Values below are upstream's v1.3.1; verify against the *installed*
 #   device version BEFORE flashing, or comment the firmware: block out entirely.
-# TODO(hardware-step + verify on-device): confirm installed XMOS firmware version == 1.3.1,
-#   else adjust url/version/md5 or drop the firmware: block.
+#
+# OPT-IN, AUSKOMMENTIERT (2026-08-08, the maintainer-Entscheidung nach Opus-Audit):
+#   WAS es tut: bei jedem Boot vergleicht voice_kit die `version:`/`md5:` hier gegen die
+#   auf dem XU316-Audiochip installierte Firmware. Weichen sie ab, startet voice_kit
+#   AUTOMATISCH ein Auto-DFU (Firmware-Flash des XMOS-Chips über I2C) auf genau diese
+#   1.3.1-Binary.
+#   WARUM Opt-in: ein fremdes HA Voice PE kann werkseitig eine NEUERE XMOS-Firmware als
+#   1.3.1 tragen. Diese Datei würde beim ersten Boot ein DOWNGRADE-DFU auslösen — bricht
+#   der I2C-Flash mittendrin ab (Stromausfall, Bus-Glitch), ist das ein Korruptionsrisiko
+#   für den Audiochip. Deshalb bleibt der Block Default AUS: kein Auto-DFU ohne explizites
+#   Ja.
+#   ANDIS GERÄT: läuft bereits nachweislich v1.3.1 (siehe RUNBOOK.md) — das Auskommentieren
+#   ändert für ihn NICHTS, voice_kit initialisiert den Chip auch ohne firmware:-Block ganz
+#   normal (nur ohne Versions-Check/Auto-Update).
+#   SCHARFSCHALTEN: installierte XMOS-Version am Gerät verifizieren (server-hand/the maintainer,
+#   siehe RUNBOOK.md Phase 1.3), dann den Block unten einkommentieren — url/version/md5
+#   müssen zur INSTALLIERTEN Version passen (bei Abweichung anpassen, nicht blind lassen).
 # -----------------------------------------------------------------------------
 voice_kit:
   id: voice_kit_component
   i2c_id: internal_i2c
   reset_pin: GPIO4
-  firmware:
-    url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
-    version: "1.3.1"
-    md5: 964635c5bf125529dab14a2472a15401
+  # firmware:
+  #   url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
+  #   version: "1.3.1"
+  #   md5: 964635c5bf125529dab14a2472a15401
 
 # -----------------------------------------------------------------------------
 # audio_dac (aic3204) — COPIED VERBATIM from upstream `audio_dac:` block.
@@ -364,12 +482,12 @@ speaker:
     #   needs an explicit input rate, the hoshi_ws_audio component sets it via AudioStreamInfo.
 
 # -----------------------------------------------------------------------------
-# micro_wake_word — on-device wake, STOCK model "okay_nabu" (NATIVE wake).
+# micro_wake_word — on-device wake, STOCK model "okay_nabu" (NATIVE wake, the maintainer 2026-06-15).
 # Schema confirmed at esphome.io/components/micro_wake_word.
 # Source for the whole block (microphone wiring + models + vad shape): upstream
 #   `micro_wake_word:` block, re-verified 2026-06-15 against home-assistant-voice.yaml@dev.
 #
-# NO custom "Hey Hoshi" model in this pass — this config stays on the upstream pre-trained model.
+# NO custom "Hey Hoshi" model in this pass — the maintainer stays on the upstream pre-trained model.
 #   The `okay_nabu` model URL below is the EXACT upstream pin (okay_nabu_20241226.3).
 #   To swap to a custom wake later: replace the `okay_nabu` entry's `model:` with the
 #   trained model (local JSON+tflite under hoshi-satellite/wake/ or a release URL) and
@@ -380,13 +498,33 @@ micro_wake_word:
   microphone:
     microphone: i2s_mics
     channels: 1          # downmix XMOS stereo → 1 ch for the detector (COPIED from upstream)
-    gain_factor: 4       # COPIED VERBATIM from upstream micro_wake_word.microphone.gain_factor
+    gain_factor: ${mic_gain_wake}  # was hardcoded 4 (upstream micro_wake_word.microphone.gain_factor)
   stop_after_detection: false   # COPIED VERBATIM from upstream
   models:
     # STOCK wake word — COPIED VERBATIM from upstream micro_wake_word.models (okay_nabu).
     # Source: home-assistant-voice.yaml@dev. URL re-verified 2026-06-15.
+    # INDEX 0 dieser Liste (dokumentiert 2026-08-08): ESPHome enabled nur das ERSTE
+    # Modell einer models:-Liste per Default (default_enabled = i==0, siehe
+    # micro_wake_word/__init__.py:499, gleicher Fund wie beim on_boot-Kommentar oben).
+    # okay_nabu ist damit der eingebaute STOCK-FALLBACK: entfernt jemand das custom
+    # ${wake_model_id}-Modell unten (das explizit in on_boot enabled wird), bleibt
+    # okay_nabu trotzdem aktiv — das Gerät wacht nie ganz ohne Wake-Modell auf.
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       id: okay_nabu
+    # CUSTOM wake „Hey Hoshi" — Lauf 1 (2026-07-20, maintainer sign-off), lokale Dateien neben
+    # diesem YAML (hey_hoshi.json referenziert hey_hoshi.tflite relativ).
+    # cutoff/window = Kalibrierwerte (Recall 99,19 %, ambient FA/h 0,103 synthetisch);
+    # das sind die On-Device-Tuning-Knöpfe — im Raum messen, dann justieren
+    # (runter Richtung 0,92 = empfindlicher, hoch Richtung 0,97 = strenger).
+    # okay_nabu bleibt als Fallback/Vergleich drin (the maintainer 20.07).
+    - model: ${wake_model}
+      id: ${wake_model_id}
+      # LAUF 2 (20.07): Raum-Test-Start war 0.70. TV-Fehlalarme (avg 0.74-0.80,
+      # max nur ~0.87 vs. 1.00 bei echten Rufen) -> auf 0.82 angehoben. Kostet
+      # etwas Fern-Empfindlichkeit (echte Distanz-Rufe lagen bei 0.73-0.76!) —
+      # der echte Fix ist Lauf 3 mit TV-Audio als reviewed negatives.
+      probability_cutoff: ${wake_cutoff}
+      sliding_window_size: 5
     # "stop" model — WIRED 2026-07-08 (B5, one flash two wins): voice-cancel a turn.
     # Detection fires on_wake_word_detected with wake_word=="Stop" (manifest string;
     # internal:true only hides the model from HA exposure — the trigger still fires,
@@ -471,13 +609,13 @@ sensor:
     on_clockwise:
       - lambda: |-
           float v = id(hoshi_volume) + 0.05f;
-          if (v > 0.85f) v = 0.85f;   // 0.85 = proven distortion-safe ceiling (Class-D amp); 1-line bump if you want it louder
+          if (v > ${vol_max}f) v = ${vol_max}f;   // ${vol_max} = bewährte, verzerrungssichere Obergrenze (Class-D-Amp); Kopf-Zeile ändern falls the maintainer lauter will
           id(hoshi_volume) = v;
           id(hoshi_ws).set_volume_runtime(v);
     on_anticlockwise:
       - lambda: |-
           float v = id(hoshi_volume) - 0.05f;
-          if (v < 0.30f) v = 0.30f;
+          if (v < ${vol_min}f) v = ${vol_min}f;
           id(hoshi_volume) = v;
           id(hoshi_ws).set_volume_runtime(v);
 
@@ -519,7 +657,7 @@ binary_sensor:
     pin: GPIO3
     on_state:
       then:
-        # Physical mute must hard-gate the uplink (privacy-critical).
+        # Physical mute must hard-gate the uplink (privacy — Tom).
         - lambda: |-
             id(hoshi_ws).set_hardware_muted(id(hardware_mute_switch).state);
 
@@ -529,7 +667,7 @@ binary_sensor:
 #
 # It:
 #   - connects to wss://${hoshi_host}:${hoshi_port}${hoshi_ws_path} via esp-idf
-#     esp_websocket_client (WEBSOCKET_TRANSPORT_OVER_SSL, cert_pem = embedded server leaf)
+#     esp_websocket_client (WEBSOCKET_TRANSPORT_OVER_SSL, cert_pem = embedded hoshi-server leaf)
 #   - auths via ?token= query (0.8 wall reads ONLY the query at the WS upgrade;
 #     bearer mode remains in the component for 0.5-era compatibility) — contract §A
 #   - on start_turn(): sends {type:start, mimeType:"audio/pcm;rate=16000", codec:"pcm16", turnId}
@@ -550,7 +688,7 @@ hoshi_ws_audio:
   microphone:
     microphone: i2s_mics
     channels: [0]          # XMOS cleaned channel (knob — flash-day verify ch0=clean, fix #6)
-    gain_factor: 1         # START AT 1 (XMOS is already AGC'd, fix #6) — raise on flash day
+    gain_factor: ${mic_gain_ws}  # START AT 1 (XMOS is already AGC'd, fix #6) — raise on flash day
     bits_per_sample: 16    # MicrophoneSource converts 32->16 for us
   speaker: hoshi_play_speaker
   # LED + micro_wake_word handles: the component drives the LED per turn-state from
@@ -560,29 +698,29 @@ hoshi_ws_audio:
   host: ${hoshi_host}
   port: ${hoshi_port}
   path: ${hoshi_ws_path}
-  # Identity fields appended to the start frame (send_start_frame_ adds both, if non-empty).
-  # Prerequisite for per-device routing of server-pushed extras (night_mode etc.),
-  # if your backend implements that; harmless metadata otherwise.
+  # Identität ins start-Frame (send_start_frame_ hängt beide an, wenn nicht leer).
+  # Voraussetzung fürs per-Gerät-Routing des night_mode-Push (server-hand 12.07).
   room: ${hoshi_room}
   satellite_id: ${hoshi_satellite_id}
-  # --- auth (docs/PROTOCOL.md §A) ---
-  # The reference backend's WS handshake reads the token ONLY from the ?token=
-  # query param (an Authorization: Bearer header is ignored at the WS upgrade
-  # for non-loopback clients) — check your own backend's handshake and set
-  # auth_mode accordingly. The component appends ?token=… to the path; the
-  # token is NOT logged (connect_ logs the token-free path_ member only).
-  # auth_token wired from secrets.yaml. NEVER commit it — secrets.yaml is gitignored.
+  # --- auth (contract §A) — 0.8-CUTOVER: MUST be query, not bearer ---
+  # The 0.8 WS handshake reads the token ONLY from the ?token= query param
+  # (web-inbound AudioWebSocketHandler.kt handle(): tokenFromQuery vs. PerimeterPort;
+  # a Bearer header is IGNORED at the WS upgrade → Close 1008 for non-loopback).
+  # The component appends ?token=… to the path; the token is NOT logged (connect_
+  # logs the token-free path_ member) and the 0.8 token is URL-safe (verified).
+  # auth_token wired from secrets.yaml (0.8 API token since 2026-07-08 = the Mac's
+  # ~/.hoshi/secrets.json["api"]). NEVER commit it — secrets.yaml is gitignored.
   auth_token: !secret hoshi_api_token
-  auth_mode: query         # bearer | query — pick whichever your backend's WS upgrade reads
-  # --- TLS (docs/PROTOCOL.md §A) — leaf-pinning (Trust-On-First-Use). Plain ws:// is a hard NO.
-  # The self-signed leaf of YOUR OWN server is embedded in the component as its
-  # own trust anchor (esp-tls cert_pem) — see hoshi_ws_audio.cpp's SERVER_LEAF_PEM
-  # placeholder, which you must replace before building. No secret/option
-  # needed once that's done — `cacert_pem` only OVERRIDES the embedded default.
-  # Flash-time verify the embedded cert hashes to the SHA-256 fingerprint your
-  # own server actually serves (`openssl x509 -noout -fingerprint -sha256 -in leaf.pem`).
-  # cacert_pem: !secret hoshi_leaf_pem   # optional override; default = embedded leaf
-  # IP-SAN sharp edge (fix #4): if your leaf's SAN is an IP and esp-tls refuses to
+  auth_mode: query         # bearer | query — 0.8 WS wall accepts ONLY query
+  # --- TLS (contract §A) — RESOLVED: leaf-pinning (the maintainer 2026-06-13). Plain ws:// VETOED (Tom).
+  # 0.8-CUTOVER 2026-07-08: the hoshi-server:8082 self-signed leaf (CN=192.0.2.10,
+  # SAN IP .106 + DNS hoshi-server/hoshi-server.local + loopback, valid 2026-06-30→2036-06-27) is
+  # EMBEDDED in the component as its own trust anchor (esp-tls cert_pem). No secret/option
+  # needed for the pilot — `cacert_pem` only OVERRIDES the embedded default.
+  # Flash-time verify the embedded cert hashes to SHA-256:
+  #   berechne ihn selbst: openssl x509 -in <leaf.pem> -noout -fingerprint -sha256
+  # cacert_pem: !secret hoshi_leaf_pem   # optional override; default = embedded hoshi-server leaf
+  # IP-SAN sharp edge (fix #4): the hoshi-server leaf SAN is an IP; if esp-tls refuses to
   # validate it against the host string at flash time, set this true (still pins the
   # exact leaf bytes via cert_pem, so it is NOT a security downgrade).
   skip_cert_common_name_check: false
@@ -590,17 +728,15 @@ hoshi_ws_audio:
   uplink_sample_rate: 16000      # PCM16 16k mono uplink (WAV per turn)
   return_sample_rate: 24000      # PCM16 24k mono return -> speaker (YAML resampler -> 48k)
   half_duplex: true              # mute mic while speaker active (AEC dead)
-  # --- Endpointing vs. background TV (field finding: "keeps listening too long") ---
-  # "Silence" is now RELATIVE to a tracked room noise floor (a slow EMA tracked at
-  # idle — the passive mic source keeps delivering blocks outside of turns too,
-  # because micro_wake_word is always listening): room boundary q = max(0.75x
-  # vad_rms_threshold, ambient x margin) · voice boundary v = max(vad_rms_threshold,
-  # qx4/3). TV level < q => counts as silence, so the turn ends after silence_ms
-  # instead of riding the 10s cap. floor_max caps this against a blaring TV (above
-  # that ceiling, behavior falls back to pre-patch). Tuning: the log shows amb/q/v
-  # per turn.
-  vad_ambient_margin: 1.30
-  vad_silence_floor_max: 2000
+  # --- Endpointing vs. Hintergrund-TV (field finding 17.07: „hört zu lange weiter") ---
+  # „Stille" ist jetzt RELATIV zum getrackten Zimmerpegel (langsame EMA im Idle — die
+  # passive Mic-Source liefert auch außerhalb von Turns, weil micro_wake_word immer
+  # hört): Zimmer-Grenze q = max(0.75×vad_rms_threshold, ambient×margin) · Stimm-
+  # Grenze v = max(vad_rms_threshold, q×4/3). TV-Pegel < q ⇒ zählt als Stille, der
+  # Turn endet nach silence_ms statt im 10-s-Deckel. floor_max deckelt gegen brüllend
+  # lauten TV (drüber = Verhalten wie vor dem Patch). Tuning: Log zeigt amb/q/v je Turn.
+  vad_ambient_margin: ${vad_ambient_margin}
+  vad_silence_floor_max: ${vad_floor_max}
   # --- output volume (fix #2: aic3204 powers up SILENT) ---
   # The aic3204 DAC defaults to digital volume -127 (silent): its setup() defers
   # write_volume_() by 2.5 s with volume_=0, clobbering the i2s speaker's boot-time
@@ -608,4 +744,4 @@ hoshi_ws_audio:
   # max 0.85); we have no media_player, so the component re-asserts this value on the
   # first SPEAKING (always > 2.5 s after boot) -> aic3204 unmute + DAC vol. 0.85 = the
   # upstream volume_max. Lower if too loud on flash day.
-  speaker_volume: 0.85
+  speaker_volume: ${vol_default}

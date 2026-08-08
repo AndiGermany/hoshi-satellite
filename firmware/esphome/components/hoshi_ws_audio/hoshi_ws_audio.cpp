@@ -3,9 +3,8 @@
 // =============================================================================
 //
 // See hoshi_ws_audio.h for the 4-context architecture + concurrency model.
-// Contract authority: docs/PROTOCOL.md (wire spec) in this repo.
-// Proven reference:    tools/bridge/napi_bridge.py (a Python no-flash test client
-//                       that speaks the exact same /ws/audio wire protocol).
+// Contract authority: hoshi-satellite/CONTRACT.md + wiki/satellite-contract-0.7.md
+// Proven reference:    hoshi-satellite/bridge/napi_bridge.py
 // =============================================================================
 
 #include "hoshi_ws_audio.h"
@@ -50,7 +49,7 @@ static const uint32_t SPEAKER_TAIL_MS = 250;
 // Grace window after llm_done before we consider the play producer quiesced (fix #2):
 // tolerates a straggler llm_audio that races llm_done over the wire.
 static const uint32_t PLAY_PRODUCER_GRACE_MS = 300;
-// Night mode (LED package 2): visibility floor for INTERACTION feedback (wake spark,
+// Nachtmodus (LED-Paket 2): visibility floor for INTERACTION feedback (wake spark,
 // listening, VU, stop-ack, boot/OTA) — whoever speaks to Hoshi at night still needs
 // to see her react. Pure info glows (timer arc, mute pixel) bypass the floor and may
 // dim to 0. Below this raw dim value an info glow is treated as "off" entirely.
@@ -62,22 +61,12 @@ static const TickType_t TX_NOTIFY_WAIT = pdMS_TO_TICKS(50);     // tx loop poll 
 #endif
 
 // -----------------------------------------------------------------------------
-// Embedded TLS trust anchor — TOFU leaf-pinning placeholder.
-//
-// The reference deployment embeds its Hoshi server's self-signed HTTPS leaf
-// cert here as the esp-tls trust anchor (Trust-On-First-Use pinning: the
-// leaf IS its own root, no CA involved). That cert is unique to one specific
-// server IP and private key, so it is NOT included in this public repo —
-// paste in YOUR OWN server's leaf cert before building, e.g.:
-//
-//   echo | openssl s_client -connect <your-hoshi-server-ip>:<port> 2>/dev/null \
-//     | openssl x509 -outform PEM
-//
-// then verify the SHA-256 fingerprint you got matches what your server
-// actually serves before flashing (`openssl x509 -noout -fingerprint -sha256 -in leaf.pem`).
-// Alternatively set `cacert_pem` in the YAML to override this default at
-// runtime instead of recompiling. See docs/PROTOCOL.md §1 (TLS) for the
-// full leaf-pinning rationale.
+// Embedded TLS trust anchor — byte-exact copy of wiki/satellite-ct106-cert.pem.
+// DO NOT MODIFY THESE BYTES. SHA-256 (flash-time verify, see header).
+// 0.8-CUTOVER 2026-07-08: this is the hoshi-server:8082 leaf (Hoshi 0.8 backend),
+// CN=192.0.2.10, SAN IP .106 + DNS hoshi-server/hoshi-server.local + loopback,
+// valid 2026-06-30 → 2036-06-27. Live-fetched from :8082 + fingerprint-verified.
+// The pre-cutover :8081 leaf (CN=hoshi-ct106) is retired with Hoshi 0.5.
 // -----------------------------------------------------------------------------
 const char *const HoshiWsAudio::SERVER_LEAF_PEM =
     "-----BEGIN CERTIFICATE-----\n"
@@ -94,7 +83,7 @@ const char *HoshiWsAudio::effective_cacert_pem_() const {
 void HoshiWsAudio::setup() {
   ESP_LOGCONFIG(TAG, "Setting up hoshi_ws_audio (Route B, off-loop networking)");
 
-  // Night mode (LED package 2): restore the last server-pushed state from NVS so a
+  // Nachtmodus (LED-Paket 2): restore the last server-pushed state from NVS so a
   // night-time reboot boots DIM — the boot comet runs BEFORE the lazy ws connect
   // could re-push the state. The server re-pushes on every connect (source of truth).
   this->night_pref_ = global_preferences->make_preference<NightModePref>(fnv1_hash("hoshi_night_mode_v1"));
@@ -177,7 +166,7 @@ void HoshiWsAudio::dump_config() {
   ESP_LOGCONFIG(TAG, "  auth_mode: %s", this->auth_mode_ == AuthMode::BEARER ? "bearer" : "query");
   ESP_LOGCONFIG(TAG, "  auth_token: %s", this->auth_token_.empty() ? "<UNSET>" : "<set>");
   ESP_LOGCONFIG(TAG, "  tls cert_pem: %s  skip_cn_check=%s",
-                this->cacert_pem_.empty() ? "<embedded server leaf>" : "<yaml override>",
+                this->cacert_pem_.empty() ? "<embedded hoshi-server leaf>" : "<yaml override>",
                 YESNO(this->skip_cn_check_));
   ESP_LOGCONFIG(TAG, "  uplink: WAV PCM16 %u Hz mono (<=%uB chunks)",
                 this->uplink_sample_rate_, (unsigned) UPLINK_CHUNK);
@@ -482,8 +471,8 @@ light::AddressableLight *HoshiWsAudio::led_addr_(bool engage) {
   return addr;
 }
 
-// OTA progress ring (LED package 1, maintainer decision: "only enable via options" applies
-// to idle decoration — the OTA ring only runs DURING a flash, so it's exempt). Called
+// OTA-Fortschritts-Ring (LED-Paket 1, the maintainer: „nur über die Optionen aktivieren" gilt für
+// Idle-Deko — der OTA-Ring läuft nur WÄHREND eines Flashes und ist damit ok). Called
 // from the YAML ota.on_progress trigger: that fires on the MAIN task inside the
 // blocking OTA receive loop, where loop()/drive_led_()/LightState::loop() do NOT run.
 // So: paint the fill arc directly and hand-flush by calling this->led_->loop() —
@@ -541,7 +530,7 @@ void HoshiWsAudio::drive_led_() {
     return;
 
   uint32_t now = millis();
-  // Gate the boot animation on the NETWORK (WiFi+IP), NOT the Hoshi ws: the ws is
+  // Gate the boot animation on the NETWORK (WiFi+IP), NOT the hoshi-server ws: the ws is
   // opened lazily by the tx task on the FIRST turn (first wake word), so connected_
   // stays false at idle — tying the LED to it would breathe forever until you talk to
   // it. network::is_connected() flips a few seconds after boot = what "ready" means
@@ -554,7 +543,7 @@ void HoshiWsAudio::drive_led_() {
     this->connect_confirm_until_ms_ = now + 1000;
   this->was_connected_ = net_up;
 
-  // ---- Night mode (LED package 2): global dim factor, server-pushed ----
+  // ---- Nachtmodus (LED-Paket 2): global dim factor, server-pushed ----
   // nd  = raw factor for pure INFO glows (timer arc, mute pixel) — may reach 0 = off.
   // ndf = floored factor for INTERACTION feedback (everything the user just caused:
   //       wake/listening/VU/ack/volume/boot) — stays visible even at dim=0.
@@ -702,7 +691,7 @@ void HoshiWsAudio::drive_led_() {
     return;
   }
 
-  // ================= LED package 1 (2026-07-08, maintainer sign-off) =================
+  // ================= LED-Paket 1 (2026-07-08, maintainer sign-off) =================
   // New animated branches (c2)-(c7). Same contract as (a)-(c): render per frame,
   // set led_force_repaint_, return; on nullptr addr FALL THROUGH so behaviour
   // degrades to the uniform (d) colours. One state load for all branches below.
@@ -756,9 +745,8 @@ void HoshiWsAudio::drive_led_() {
     }
   }
 
-  // ---- (c4) Speaker-accent shimmer: short accent glow when the server names a speaker ----
-  // (ws task sets accent+window atomically; an optional downlink extension that maps a
-  // recognized speaker to an LED accent color.)
+  // ---- (c4) Sprecher-Schimmer: short accent glow when the server names a speaker ----
+  // (ws task sets accent+window atomically; Szenario 8 — Sakura/Gold/Grau als Licht.)
   {
     uint32_t flash_until = this->speaker_flash_until_ms_.load();
     uint32_t accent = this->speaker_accent_rgb_.load();
@@ -831,7 +819,7 @@ void HoshiWsAudio::drive_led_() {
   // ---- (c7) IDLE-Info: timer countdown arc + mute pixel (both very dim) ----
   // Timer state comes from the ws timer_state frame (atomics); remaining is
   // extrapolated locally from the rx timestamp so the arc moves between pushes.
-  // Deliberately NO idle decoration beyond these two (maintainer call: nothing that disturbs sleep).
+  // Deliberately NO idle decoration beyond these two (the maintainer: nothing that disturbs sleep).
   if (st == TurnState::IDLE) {
     bool muted = this->hardware_muted_.load();
     int32_t total = this->timer_total_s_.load();
@@ -1007,10 +995,10 @@ void HoshiWsAudio::to_error_(const char *why) {
 // (1) mic callback context — passive MicrophoneSource gives PCM16 mono ready.
 // =============================================================================
 void HoshiWsAudio::on_pcm16_(const std::vector<uint8_t> &data) {
-  // --- Ambient floor tracking (endpointing vs. background TV, field finding 2026-07-17) ---
+  // --- Ambient-Floor-Tracking (Endpointing vs. Hintergrund-TV, field finding 17.07) ---
   // Outside LISTENING the mic KEEPS streaming (the passive MicrophoneSource rides on
   // micro_wake_word, the always-on consumer; only SPEAKING stops mww, fix #7). Use
-  // those idle blocks to track the ROOM's noise floor (TV, dishwasher, …) as a slow
+  // those idle blocks to track the ROOM's noise floor (TV, Spülmaschine, …) as a slow
   // EMA (~1.5 s settle at ~30 ms blocks). vad_feed_ then judges "silence" RELATIVE to
   // this floor, so background speech no longer holds the recording window open.
   // Subsampled ×4: idle CPU stays negligible. Mic-cb context only (plain member).
@@ -1255,7 +1243,7 @@ bool HoshiWsAudio::connect_() {
   cfg.port = this->port_;
   cfg.transport = WEBSOCKET_TRANSPORT_OVER_SSL;   // wss only (plain ws VETOED)
   cfg.cert_pem = this->effective_cacert_pem_();    // leaf-pin (contract §A)
-  // IP-SAN sharp edge (fix #4): a leaf whose SAN is an IP address, which some esp-tls
+  // IP-SAN sharp edge (fix #4): the hoshi-server leaf SAN is an IP, which some esp-tls
   // builds won't validate against the host string. Allow skipping the CN/SAN check
   // (we still pin the exact leaf bytes via cert_pem, so this is not a downgrade).
   cfg.skip_cert_common_name_check = this->skip_cn_check_;
@@ -1425,10 +1413,10 @@ double HoshiWsAudio::block_rms_(const int16_t *samples, size_t n, size_t stride)
   return cnt > 0 ? std::sqrt(acc / (double) cnt) : 0.0;
 }
 
-// Energy VAD with ROOM-RELATIVE endpointing (reworked 2026-07-17, field finding:
-// "keeps listening too long with the TV on"). Two derived boundaries per block:
-//   q ("room")  = max(0.75×thr, ambient×margin), capped at vad_silence_floor_max_
-//   v ("voice") = max(thr, q×4/3)   — preserves the original 0.75-hysteresis ratio
+// Energy VAD with ROOM-RELATIVE endpointing (umgebaut 2026-07-17, field finding:
+// „hört bei laufendem Fernseher zu lange weiter"). Two derived boundaries per block:
+//   q ("Zimmer") = max(0.75×thr, ambient×margin), capped at vad_silence_floor_max_
+//   v ("Stimme") = max(thr, q×4/3)   — preserves the original 0.75-hysteresis ratio
 // rms ≥ v = user speech (start / reset silence run) · rms < q = room level = silence
 // counts · dead zone q..v = hold. With a quiet room (ambient→0) both collapse to the
 // pre-patch absolute behaviour (q=0.75×thr, v=thr); a blaring TV is capped by
@@ -1677,9 +1665,9 @@ void HoshiWsAudio::on_ws_text_(const char *buf, size_t len) {
   } else if (mtype == "sidecar_alarm") {
     ESP_LOGW(TAG, "ws <- sidecar_alarm: %s", json.c_str());
   } else if (mtype == "timer_state") {
-    // LED package 1 (c7): timer countdown arc. Device side of the proposed downlink
-    // push {type:"timer_state", remainingS:<int>, totalS:<int>} — the server side
-    // is not implemented yet in the reference backend; until it lands this branch is
+    // LED-Paket 1 (c7): timer countdown arc. Device side of the proposed downlink
+    // push {type:"timer_state", remainingS:<int>, totalS:<int>} — server side is a
+    // Bus-Bitte an die server-hand (2026-07-08); until it lands this branch is
     // simply never taken. totalS<=0 (or remainingS<=0) clears the arc. ws-task
     // context -> atomics; drive_led_ extrapolates remaining between pushes.
     long total = 0, rem = 0;
@@ -1690,28 +1678,26 @@ void HoshiWsAudio::on_ws_text_(const char *buf, size_t len) {
     this->timer_rx_ms_.store(millis());
     ESP_LOGI(TAG, "ws <- timer_state remaining=%lds total=%lds", rem, total);
   } else if (mtype == "speaker") {
-    // LED package 1 (c4): recognition shimmer — device side of an optional "speaker"
-    // downlink extension. If your backend can identify who's talking, it can push
-    // {type:"speaker", speakerId:"..."} for a brief per-speaker accent-color glow.
-    // Not implemented server-side in the reference deployment; the accent map lives
-    // HERE (device), so the wire only ever carries a plain speakerId string — extend
-    // the table below with your own household's speaker IDs and colors.
+    // LED-Paket 1 (c4): recognition shimmer (Szenario 8 — Sprecher-Farben als Licht).
+    // Device side of the speaker downlink; heute übersetzt der 0.8-WS-Rand das
+    // speaker-Event bewusst zu null (ChatEventWsTranslator) — Bus-Bitte offen.
+    // Accent map lives HERE (device), so the wire stays a plain speakerId.
     std::string sid;
     if (!HoshiWsAudio::json_get_string_(json, "speakerId", sid) || sid.empty())
       HoshiWsAudio::json_get_string_(json, "recognizedSpeaker", sid);
     uint32_t rgb;
-    if (sid == "example-speaker-a") {
-      rgb = 0x01FFAA28u;  // warm gold
-    } else if (sid == "example-speaker-b") {
-      rgb = 0x01FF6E96u;  // sakura pink
+    if (sid == "the maintainer") {
+      rgb = 0x01FFAA28u;  // warmes Gold
+    } else if (sid == "a household member") {
+      rgb = 0x01FF6E96u;  // Sakura
     } else {
-      rgb = 0x018C8C96u;  // unknown/guest: neutral grey (never guessed)
+      rgb = 0x018C8C96u;  // Gast/unbekannt: neutrales Grau (nie geraten)
     }
     this->speaker_accent_rgb_.store(rgb);
     this->speaker_flash_until_ms_.store(millis() + 700);
     ESP_LOGI(TAG, "ws <- speaker '%s' -> accent shimmer", sid.c_str());
   } else if (mtype == "night_mode") {
-    // Night mode (LED package 2, maintainer sign-off 2026-07-15): server-pushed global dim.
+    // Nachtmodus (LED-Paket 2, maintainer sign-off 15.07): server-pushed global dim.
     // {"type":"night_mode","active":<bool>,"dim":<float 0..1>} — Serverseite live
     // seit 12.07 (Push bei ws-Connect + Settings-PUT + Scheduler-Grenze). ws-Task
     // context -> atomics; loop() persists to NVS via the dirty flag (single writer).

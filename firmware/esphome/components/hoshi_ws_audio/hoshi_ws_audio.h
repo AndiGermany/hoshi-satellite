@@ -27,8 +27,8 @@
 //                       Reassembles fragmented text, base64-decodes llm_audio into
 //                       play_rb_. NEVER sends here (recursive-lock deadlock).
 //
-// Contract authority: docs/PROTOCOL.md (wire spec) in this repo.
-// Proven reference:    tools/bridge/napi_bridge.py (same /ws/audio flow)
+// Contract authority: hoshi-satellite/CONTRACT.md + wiki/satellite-contract-0.7.md
+// Proven reference:    hoshi-satellite/bridge/napi_bridge.py (same /ws/audio flow)
 // =============================================================================
 
 #pragma once
@@ -319,7 +319,7 @@ class HoshiWsAudio : public Component {
   // cleared once on the first uniform (d) frame so (d) repaints the turn-state colour and
   // no animation pixels are left hanging.
   bool led_addr_active_{false};
-  // ---- LED package 1 (2026-07-08, maintainer sign-off) ----
+  // ---- LED-Paket 1 (2026-07-08, maintainer sign-off) ----
   // One-shot animation windows, all written on the main loop (YAML lambdas / loop
   // callbacks) and read in drive_led_ -> plain members are safe (same task).
   uint32_t wake_spark_until_ms_{0};  // (c3) white->cyan bloom right after wake
@@ -336,7 +336,7 @@ class HoshiWsAudio : public Component {
   // 0x01RRGGBB (flag bit distinguishes "guest grey" from "never set").
   std::atomic<uint32_t> speaker_accent_rgb_{0};
   std::atomic<uint32_t> speaker_flash_until_ms_{0};
-  // ---- Night mode (LED package 2, maintainer sign-off 2026-07-15) ----
+  // ---- Nachtmodus (LED-Paket 2, maintainer sign-off 15.07) ----
   // Server-pushed night_mode frame (ws task WRITES, loop/main READS -> atomics).
   // active=false => factor 1.0 (normal). dim = global 0..1 factor on all LED
   // effects; interaction feedback additionally gets a visibility floor in
@@ -393,12 +393,9 @@ class HoshiWsAudio : public Component {
   TaskHandle_t tx_task_{nullptr};
 #endif
 
-  // ---- Embedded TLS trust anchor (Trust-On-First-Use leaf-pinning) ----
-  //   PLACEHOLDER — replace with YOUR OWN server's leaf certificate before
-  //   building (see the long comment above SERVER_LEAF_PEM's definition in
-  //   hoshi_ws_audio.cpp). At flash time, verify the embedded bytes hash to
-  //   the SHA-256 fingerprint your own server actually serves:
-  //   `openssl x509 -noout -fingerprint -sha256 -in your-leaf.pem`
+  // ---- Embedded TLS trust anchor (contract §A Leaf-Pinning) ----------
+  //   0.8-cutover leaf (hoshi-server:8082, since 2026-07-08). SHA-256 (verify at flash time):
+  //   berechne ihn selbst: openssl x509 -in <leaf.pem> -noout -fingerprint -sha256
   static const char *const SERVER_LEAF_PEM;
 };
 

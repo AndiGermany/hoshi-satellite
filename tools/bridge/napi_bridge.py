@@ -21,7 +21,7 @@ Protocol references (read 2026-06-15):
   - ESPHome firmware voice_assistant.cpp request_start()/on_event()/on_audio()
     (device SAMPLE_RATE_HZ = 16000).
   - esphome/home-assistant-voice-pe#477 (this exact use case; handshake still open).
-  - Hoshi contract: see ../../docs/PROTOCOL.md in this repo.
+  - Hoshi contract: wiki/satellite-contract-0.7.md, hoshi-satellite/CONTRACT.md.
 
 HANDSHAKE WE IMPLEMENT (client = us, "server"/HA role):
   1. APIClient.connect(login=True) then subscribe_voice_assistant(handle_start,
@@ -87,7 +87,8 @@ UPLINK_CHUNK = 16384  # bytes per /ws/audio binary frame; Hoshi cuts off oversiz
 # VoiceAssistantRequest(start=false) => handle_stop is never called), so the
 # bridge must detect silence itself and emit a single {type:"stop"} to Hoshi.
 #
-# VAD = Silero (ONNX): a neural speech-probability model is far more
+# VAD = Silero (ONNX), per the maintainer's endpointing research (wiki/endpointing-
+# architecture-0.7.md, Stage 0-1): a neural speech-probability model is far more
 # noise/TV-robust than raw RMS energy. Silero runs on EXACTLY 512-sample frames
 # @16k (32 ms); a hysteresis state machine on its probability decides speech/
 # silence, and `silence_ms` of contiguous quiet ends the utterance.
@@ -133,7 +134,7 @@ class Config:
     api_port: int = 6053
     encryption_key: Optional[str] = None  # ESPHome API "noise_psk" (base64); None = keyless
     api_password: str = ""  # legacy password auth (stock devices usually empty)
-    hoshi_ws_url: str = "wss://<hoshi-server-ip>:8081/ws/audio"
+    hoshi_ws_url: str = "wss://192.0.2.10:8081/ws/audio"
     cert_path: Optional[str] = None  # PEM trust anchor for wss leaf-pinning
     token: Optional[str] = None  # Hoshi ingress token; None unless auth gate is ON
     room: Optional[str] = None
@@ -453,7 +454,7 @@ class SpeechVad:
     Silero model. A leftover partial frame at end-of-stream is zero-padded. The
     LSTM state is reset per turn (a fresh SpeechVad per turn does this).
 
-    Hysteresis state machine on the Silero probability:
+    Hysteresis state machine on the Silero probability (per the maintainer's research):
       1. Speech START: prob >= `threshold` accumulates voiced time; once
          `min_speech_ms` of cumulative voiced audio is seen -> speech started
          (a debounce guard against a single noisy frame).
@@ -788,10 +789,9 @@ class Bridge:
             ssl_ctx = ssl.create_default_context()
             if self.cfg.cert_path:
                 ssl_ctx.load_verify_locations(self.cfg.cert_path)
-            # The reference deployment's leaf is self-signed with a SAN covering
-            # its server's LAN IP. Pinning the cert as the trust anchor validates
-            # the chain; hostname check still applies and the SAN covers the IP,
-            # so keep verification ON.
+            # Leaf is self-signed CN=hoshi-ct106 with SAN IP .106. Pinning the cert
+            # as the trust anchor validates the chain; hostname check still applies
+            # and the SAN covers the IP, so keep verification ON.
         url = self.cfg.hoshi_ws_url
         if self.cfg.token:
             sep = "&" if "?" in url else "?"
@@ -1010,7 +1010,7 @@ class Bridge:
                 elif mtype == "no_input":
                     # Empty STT: end the turn QUIETLY (no ERROR event = no red
                     # light). The device wakes, hears nothing usable, and should
-                    # fall back to idle, not flash an error.
+                    # fall back to idle, not flash an error. (server-hand req.)
                     LOG.info("no_input -> soft idle (no error event)")
                     self._end_turn_idle(turn, reason="no_input")
                     return
@@ -1142,7 +1142,7 @@ class Bridge:
         For empty STT / no_input: emit a benign STT_END(text="") so the device's
         voice-assistant state machine advances out of LISTENING, then RUN_END ->
         the device returns to idle quietly instead of flashing the error feedback.
-        (UNVERIFIED on real hardware; verify the LED behaviour live on your own device.)
+        (UNVERIFIED on real hardware; server-hand validates the LED behaviour live.)
         """
         turn.error = None
         LOG.info("ending turn idle (reason=%s, no error) turn=%s", reason, turn.turn_id)
@@ -1189,16 +1189,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "Omit to try keyless first; env ESPHOME_API_KEY also works.")
     p.add_argument("--api-password", default=None,
                    help="Legacy ESPHome API password (env ESPHOME_API_PASSWORD).")
-    p.add_argument("--hoshi-ws-url", default="wss://<hoshi-server-ip>:8081/ws/audio",
-                   help="Hoshi /ws/audio URL. Required: set this to your own server.")
+    p.add_argument("--hoshi-ws-url", default="wss://192.0.2.10:8081/ws/audio",
+                   help="Hoshi /ws/audio URL.")
     p.add_argument("--cert", default=None,
-                   help="PEM trust anchor for wss (default: certs/hoshi-server-leaf.pem "
-                        "next to this repo, if present). env HOSHI_CERT also works.")
+                   help="PEM trust anchor for wss (default: wiki/satellite-ct106-cert.pem). "
+                        "env HOSHI_CERT also works.")
     p.add_argument("--token-file", default=None,
                    help="File with Hoshi ingress token (only if auth gate is ON). "
                         "env HOSHI_API_TOKEN also works.")
-    p.add_argument("--room", default=None, help="Optional room id (optional start-frame identity field).")
-    p.add_argument("--satellite-id", default=None, help="Optional satellite id (optional start-frame identity field).")
+    p.add_argument("--room", default=None, help="Optional room id (S-3 start field).")
+    p.add_argument("--satellite-id", default=None, help="Optional satellite id (S-3 start field).")
     p.add_argument("--uplink-format", choices=("wav", "webm"), default="wav",
                    help="Hoshi binary uplink container. Only 'wav' is implemented "
                         "(raw PCM is rejected by Hoshi STT); 'webm' is a TODO "
@@ -1245,11 +1245,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_cert() -> Optional[str]:
-    # Convenience default: a leaf cert dropped in certs/hoshi-server-leaf.pem next
-    # to the repo root (gitignored). Not present in a fresh checkout — pass --cert
-    # explicitly (or env HOSHI_CERT) until you've placed your own server's leaf here.
+    # repo wiki cert (read-only) as a convenience default for wss pinning.
     here = Path(__file__).resolve()
-    cert = here.parents[2] / "certs" / "hoshi-server-leaf.pem"
+    cert = here.parents[2] / "wiki" / "satellite-ct106-cert.pem"
     return str(cert) if cert.is_file() else None
 
 

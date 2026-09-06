@@ -722,7 +722,10 @@ hoshi_ws_audio:
   # needed for the pilot — `cacert_pem` only OVERRIDES the embedded default.
   # Flash-time verify the embedded cert hashes to SHA-256:
   #   berechne ihn selbst: openssl x509 -in <leaf.pem> -noout -fingerprint -sha256
-  # cacert_pem: !secret hoshi_leaf_pem   # optional override; default = embedded hoshi-server leaf
+  # CA-PIN (2026-09-05, Hand 14, ENTWURF satellite-hand-ca-pin): the anchor is the Hoshi Home CA
+  # (~/.hoshi/ca/hoshi-ca.crt, public) instead of the leaf bytes -- prod serves a CA-signed leaf
+  # since 2026-09-02 21:37, so the satellite survives every leaf renewal without a flash.
+  cacert_pem: !secret hoshi_ca_pem
   # IP-SAN sharp edge (fix #4): the hoshi-server leaf SAN is an IP; if esp-tls refuses to
   # validate it against the host string at flash time, set this true (still pins the
   # exact leaf bytes via cert_pem, so it is NOT a security downgrade).

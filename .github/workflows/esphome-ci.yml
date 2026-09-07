@@ -51,6 +51,9 @@ jobs:
         run: |
           if [ -f secrets.yaml.example ]; then
             cp secrets.yaml.example secrets.yaml
+            # The example ships EMPTY values (fill-me markers); esphome rejects an empty
+            # SSID at config time, so CI substitutes a harmless placeholder (2026-09-07).
+            sed -i 's/: ""[[:space:]]*$/: "ci-placeholder"/' secrets.yaml
           else
             echo "::warning::secrets.yaml.example is missing — compile will likely fail on !secret lookups."
           fi
